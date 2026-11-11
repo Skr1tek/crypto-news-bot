@@ -61,3 +61,12 @@ To preserve history, download `sent.sqlite3` from the current bot-state branch p
 Automated tests use mocked Telegram/RSS boundaries and real temporary SQLite databases. A real end-to-end check needs the deployment host, bot secret, and administrator ID: verify `/start` is ignored for a second account; create/edit/delete a test topic; pick a test channel; assign/unassign it; restart and check persistence; revoke posting rights and check delivery is refused. No live Telegram publication is performed by the test suite.
 
 Protocol references: https://core.telegram.org/bots/api#keyboardbuttonrequestchat and https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule.
+
+
+## Если Telegram API заблокирован
+
+Боту нужен доступ к `https://api.telegram.org` непосредственно с компьютера, где он запущен. VPN должен распространяться на весь компьютер или включать Python в маршрутизацию. Расширение браузера, прокси внутри приложения Telegram и MTProto-прокси сами по себе этого не обеспечивают.
+
+Если доступен HTTP/HTTPS-прокси, Python requests поддерживает его через переменную окружения `HTTPS_PROXY`, заданную в том же окне PowerShell перед запуском бота. Адрес и порт берите у своего провайдера прокси. Учетные данные прокси храните как секреты, не публикуйте их в логах. Для SOCKS требуется дополнительный компонент requests[socks]. Не отключайте проверку TLS-сертификатов.
+
+Сообщения запуска теперь различают connection (соединение/DNS/возможная блокировка), timeout, proxy, TLS и ответы Telegram 401/403/404/409/429. Полный адрес запроса и текст ответа сервера скрыты, чтобы исключить утечку токена. Тип сетевой ошибки не доказывает блокировку: для проверки включите рабочий VPN для всего ПК и повторите запуск.

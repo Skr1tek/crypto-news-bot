@@ -35,6 +35,10 @@ class Store:
         return copy.deepcopy(self.get('config'))
 
 
+class TelegramError(ValueError):
+    """Safe diagnostic: never includes request URLs, server text or credentials."""
+
+
 class Telegram:
     def __init__(self, token):
         self.token = token
@@ -42,13 +46,38 @@ class Telegram:
     def __call__(self, method, **data):
         try:
             response = requests.post(f'https://api.telegram.org/bot{self.token}/{method}', json=data, timeout=40)
-            response.raise_for_status()
+        except requests.exceptions.SSLError:
+            raise TelegramError('Telegram TLS: ошибка сертификата. Проверьте дату ПК и настройки защищённого соединения.') from None
+        except requests.exceptions.ProxyError:
+            raise TelegramError('Telegram proxy: не удалось подключиться через прокси. Проверьте его адрес и доступность.') from None
+        except requests.Timeout:
+            raise TelegramError('Telegram timeout: сервер не ответил вовремя. Проверьте интернет и доступ к api.telegram.org.') from None
+        except requests.ConnectionError:
+            raise TelegramError('Telegram connection: соединение не установлено. Возможны блокировка, ошибка DNS или отсутствие интернета. Проверьте доступ к api.telegram.org; при блокировке нужен VPN для всего ПК или HTTPS-прокси.') from None
+        except requests.RequestException:
+            raise TelegramError('Telegram request: ошибка запроса. Проверьте настройки сети.') from None
+        status = response.status_code
+        try:
             payload = response.json()
-            if not payload.get('ok'):
-                raise ValueError()
-            return payload['result']
-        except (requests.RequestException, ValueError, KeyError):
-            raise ValueError('Telegram: запрос не выполнен. Проверьте доступ и права бота.') from None
+        except ValueError:
+            payload = None
+        if not isinstance(status, int):
+            raise TelegramError('Telegram response: неизвестный ответ сервера.')
+        if status >= 400 or (isinstance(payload, dict) and payload.get('ok') is False):
+            api_code = payload.get('error_code') if isinstance(payload, dict) else None
+            code = api_code if type(api_code) is int and 400 <= api_code <= 599 else status
+            reasons = {
+                400: 'Некорректные параметры запроса.',
+                401: 'Токен бота не принят. Заново введите токен от BotFather.',
+                403: 'Доступ запрещён: проверьте блокировку бота и его права в чате.',
+                404: 'Адрес API не найден. Проверьте токен: без кавычек, пробелов и префикса bot.',
+                409: 'Конфликт: остановите другой процесс бота и проверьте webhook.',
+                429: 'Слишком много запросов. Подождите перед повторным запуском.',
+            }
+            raise TelegramError('Telegram ' + str(code) + ': ' + reasons.get(code, 'Сервис недоступен или запрос отклонён. Повторите позже.'))
+        if not isinstance(payload, dict) or payload.get('ok') is not True or 'result' not in payload:
+            raise TelegramError('Telegram response: неожиданный формат ответа. Проверьте доступ к API и сетевые фильтры.')
+        return payload['result']
 
 
 def validate_target(api, raw, admin):
@@ -307,10 +336,13 @@ def main():
             for update in updates:
                 controller.handle(update)
                 store.put('offset', update['update_id'] + 1)
-        except ValueError:
-            print('Telegram unavailable; retrying')
+        except TelegramError as exc:
+            print(str(exc))
             time.sleep(5)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except TelegramError as exc:
+        raise SystemExit(str(exc)) from None

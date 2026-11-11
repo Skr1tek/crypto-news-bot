@@ -25,17 +25,66 @@ KEYWORDS = ('крипт', 'цифров', 'блокчейн', 'токен', 'м�
 EVENT_WORDS = ('форум', 'конференц', 'саммит', 'встреч', 'мероприят', 'спикер')
 
 
+# Conservative headline heuristic, not full semantic understanding.
+STORY_STOP = set('и в во на с со по для из от к о об до за при как что это стал стала стали впервые первые провела форме'.split())
+STORY_SUFFIX = ('иями', 'ами', 'ями', 'ого', 'ему', 'ому', 'ыми', 'ими', 'ий', 'ый', 'ой', 'ая', 'яя', 'ое', 'ее', 'ые', 'ие', 'ых', 'их', 'ую',
+                'юю', 'ов', 'ев', 'ам', 'ям', 'ах', 'ях', 'ом', 'ем', 'а', 'я', 'ы', 'и', 'у', 'ю', 'е')
+
+
+def story_tokens(title):
+    # Google News appends publisher names; they must not distinguish stories.
+    headline = title.rsplit(' - ', 1)[0].casefold().replace('ё', 'е')
+    result = set()
+    for word in re.findall(r'[a-zа-я]+|[0-9]+', headline):
+        if word in STORY_STOP:
+            continue
+        if word.isdigit():
+            result.add(word)
+            continue
+        if len(word) < 3:
+            continue
+        for suffix in STORY_SUFFIX:
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                word = word[:-len(suffix)]
+                break
+        result.add(word[:6])
+    return result
+
+
+def same_story(left, right):
+    a, b = story_tokens(left), story_tokens(right)
+    if not a or not b:
+        return False
+    # Numbers can distinguish separate placements, dates or amounts.
+    if {x for x in a if x.isdigit()} != {x for x in b if x.isdigit()}:
+        return False
+    shared = len(a & b)
+    exact = re.sub(r'\W+', '', left.rsplit(' - ', 1)[0].casefold()) == re.sub(r'\W+', '', right.rsplit(' - ', 1)[0].casefold())
+    return (exact or (len(a) >= 3 and a == b) or (shared >= 4 and shared / min(len(a), len(b)) >= 0.5
+                       and shared / len(a | b) >= 0.3))
+
+
 def rank_items(items, limit=5):
-    unique = {}
-    for item in items:
-        key = re.sub(r'\W+', '', item['title'].casefold())[:120]
-        if key not in unique or item['date'] > unique[key]['date']:
-            unique[key] = item
-    return sorted(unique.values(), key=lambda item: (item['event'], item['date']), reverse=True)[:limit]
+    groups = []
+    for item in sorted(items, key=lambda x: (x['event'], x['date']), reverse=True):
+        for group in groups:
+            if same_story(item['title'], group[0]['title']):
+                group.append(item)
+                break
+        else:
+            groups.append([item])
+    ranked = []
+    for group in groups:
+        representative = dict(group[0])
+        representative['_aliases'] = group
+        if any('categories' in item for item in group):
+            representative['categories'] = sorted({c for item in group for c in item.get('categories', [])})
+        ranked.append(representative)
+    return ranked[:limit]
 
 
-def collect_news():
-    config = load_config()
+def collect_news(config=None):
+    config = load_config() if config is None else config
     cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
     items = []
     queries = {}
@@ -154,12 +203,12 @@ def send_message(token, chat_id, items):
         raise ValueError('Telegram delivery failed') from None
 
 
-def main():
+def main(config=None, target_validator=None):
     token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
     if not token:
         raise SystemExit('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID or TELEGRAM_TARGETS')
     try:
-        config = load_config()
+        config = load_config() if config is None else config
     except (ValueError, TypeError, OSError):
         raise SystemExit('Invalid news configuration; check categories and Telegram targets') from None
     state = Path(os.environ.get('NEWS_STATE_PATH', 'data/sent.sqlite3'))
@@ -167,17 +216,32 @@ def main():
     failed = False
     with closing(sqlite3.connect(state)) as db:
         db.execute('CREATE TABLE IF NOT EXISTS sent (chat_id TEXT, item_key TEXT, PRIMARY KEY (chat_id, item_key))')
-        items = collect_news()
+        db.execute('CREATE TABLE IF NOT EXISTS stories (chat_id TEXT, title TEXT, published REAL, PRIMARY KEY (chat_id, title))')
+        db.execute('DELETE FROM stories WHERE published < ?', ((datetime.now(timezone.utc) - timedelta(days=7)).timestamp(),))
+        db.commit()
+        items = collect_news() if target_validator is None else collect_news(config)
         for target in config['targets']:
             chat_id = target['chat_id']
+            if not target['categories']:
+                continue
+            if target_validator is not None:
+                try:
+                    target_validator(chat_id)
+                except ValueError:
+                    failed = True
+                    continue
             known = {row[0] for row in db.execute('SELECT item_key FROM sent WHERE chat_id = ?', (chat_id,))}
             candidates = [item for item in items
                           if set(item.get('categories', config['categories'])) & set(target['categories'])]
-            # Merge rubric memberships before selecting and deduplicating.
+            recent = list(db.execute('SELECT title, published FROM stories WHERE chat_id=?', (chat_id,)))
+            # Match recent confirmed stories before filling the five-story limit.
             fresh = []
             for item in rank_items(candidates, limit=None):
-                keys = item_keys(item)
-                if not known.intersection(keys):
+                aliases = item.get('_aliases', [item])
+                keys = {key for alias in aliases for key in item_keys(alias)}
+                seen_story = any(abs(item['date'].timestamp() - stamp) <= 72 * 3600
+                                 and same_story(item['title'], title) for title, stamp in recent)
+                if not known.intersection(keys) and not seen_story:
                     fresh.append(item)
                     known.update(keys)
                 if len(fresh) == 5:
@@ -200,8 +264,11 @@ def main():
                     failed = True
                     break
                 for item in batch:
-                    db.executemany('INSERT OR IGNORE INTO sent VALUES (?, ?)',
-                                   [(chat_id, key) for key in item_keys(item)])
+                    for alias in item.get('_aliases', [item]):
+                        db.executemany('INSERT OR IGNORE INTO sent VALUES (?, ?)',
+                                       [(chat_id, key) for key in item_keys(alias)])
+                        db.execute('INSERT OR REPLACE INTO stories VALUES (?, ?, ?)',
+                                   (chat_id, alias['title'], alias['date'].timestamp()))
                 db.commit()
                 print('Telegram digest delivered')
     if failed:

@@ -48,34 +48,37 @@ class Telegram:
                 raise ValueError()
             return payload['result']
         except (requests.RequestException, ValueError, KeyError):
-            raise ValueError('Telegram: Р·Р°РїСЂРѕСЃ РЅРµ РІС‹РїРѕР»РЅРµРЅ. РџСЂРѕРІРµСЂСЊС‚Рµ РґРѕСЃС‚СѓРї Рё РїСЂР°РІР° Р±РѕС‚Р°.') from None
+            raise ValueError('Telegram: запрос не выполнен. Проверьте доступ и права бота.') from None
 
 
 def validate_target(api, raw, admin):
     if isinstance(raw, bool) or not re.fullmatch(r'-?[1-9][0-9]{0,15}', str(raw)):
-        raise ValueError('РќСѓР¶РµРЅ С‡РёСЃР»РѕРІРѕР№ chat_id, Р±РµР· СЃСЃС‹Р»РѕРє Рё @username.')
+        raise ValueError('Нужен числовой chat_id, без ссылок и @username.')
     chat_id = int(raw)
     if abs(chat_id) >= 2**52:
-        raise ValueError('chat_id РІРЅРµ РґРѕРїСѓСЃС‚РёРјРѕРіРѕ РґРёР°РїР°Р·РѕРЅР°.')
+        raise ValueError('chat_id вне допустимого диапазона.')
     chat = api('getChat', chat_id=chat_id)
     if chat['id'] != chat_id:
-        raise ValueError('chat_id РЅРµ СЃРѕРІРїР°РґР°РµС‚.')
+        raise ValueError('chat_id не совпадает.')
     if chat['type'] == 'private':
-        if chat_id != admin:
-            raise ValueError('Р›РёС‡РЅС‹Р№ РїРѕР»СѓС‡Р°С‚РµР»СЊ вЂ” С‚РѕР»СЊРєРѕ С‡Р°С‚ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР°.')
+        if chat_id <= 0:
+            raise ValueError('Invalid private chat_id')
+        # Private recipients must open/start the bot first; a typing action
+        # verifies reachability without publishing a probe message.
+        api('sendChatAction', chat_id=chat_id, action='typing')
     elif chat['type'] in ('group', 'supergroup', 'channel'):
         me = api('getMe')
         member = api('getChatMember', chat_id=chat_id, user_id=me['id'])
         # Require admin for groups too: avoids default/restricted permission ambiguity.
         if member['status'] not in ('administrator', 'creator'):
-            raise ValueError('РЎРЅР°С‡Р°Р»Р° РЅР°Р·РЅР°С‡СЊС‚Рµ Р±РѕС‚Р° Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂРѕРј РіСЂСѓРїРїС‹ РёР»Рё РєР°РЅР°Р»Р°.')
+            raise ValueError('Сначала назначьте бота администратором группы или канала.')
         if chat['type'] == 'channel' and member['status'] != 'creator' and not member.get('can_post_messages'):
-            raise ValueError('Р‘РѕС‚Сѓ РЅСѓР¶РЅРѕ РїСЂР°РІРѕ РїСѓР±Р»РёРєР°С†РёРё РІ РєР°РЅР°Р»Рµ.')
+            raise ValueError('Боту нужно право публикации в канале.')
         owner = api('getChatMember', chat_id=chat_id, user_id=admin)
         if owner['status'] not in ('administrator', 'creator'):
-            raise ValueError('Р’С‹ РґРѕР»Р¶РЅС‹ Р±С‹С‚СЊ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂРѕРј РїРѕР»СѓС‡Р°С‚РµР»СЏ.')
+            raise ValueError('Вы должны быть администратором получателя.')
     else:
-        raise ValueError('Р­С‚РѕС‚ С‚РёРї С‡Р°С‚Р° РЅРµ РїРѕРґРґРµСЂР¶РёРІР°РµС‚СЃСЏ.')
+        raise ValueError('Этот тип чата не поддерживается.')
     return {'chat_id': str(chat_id), 'title': chat.get('title', chat.get('first_name', str(chat_id))), 'categories': []}
 
 
@@ -94,11 +97,11 @@ class Controller:
 
     def say(self, text, rows=None, markup=None):
         self.api('sendMessage', chat_id=self.admin, text=text,
-                 reply_markup=markup or buttons(rows or [[('РњРµРЅСЋ', 'menu')]]))
+                 reply_markup=markup or buttons(rows or [[('Меню', 'menu')]]))
 
     def menu(self):
-        self.say('РџР°РЅРµР»СЊ СѓРїСЂР°РІР»РµРЅРёСЏ РЅРѕРІРѕСЃС‚СЏРјРё', [[('вћ• Р”РѕР±Р°РІРёС‚СЊ С‚РµРјСѓ', 'add'), ('рџ“‹ Р СѓР±СЂРёРєРё', 'topics')],
-                 [('рџ‘Ґ РџРѕР»СѓС‡Р°С‚РµР»Рё', 'targets'), ('вћ• РџРѕР»СѓС‡Р°С‚РµР»СЊ', 'target')], [('рџ•— Р Р°СЃРїРёСЃР°РЅРёРµ', 'schedule')]])
+        self.say('Панель управления новостями', [[('➕ Добавить тему', 'add'), ('📋 Рубрики', 'topics')],
+                 [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule')]])
 
     def handle(self, update):
         callback = update.get('callback_query')
@@ -111,7 +114,7 @@ class Controller:
         try:
             self.process(message, callback.get('data') if callback else None)
         except (ValueError, KeyError, StopIteration):
-            self.say('Р”РµР№СЃС‚РІРёРµ РЅРµ РІС‹РїРѕР»РЅРµРЅРѕ. РџСЂРѕРІРµСЂСЊС‚Рµ РґР°РЅРЅС‹Рµ, РЅР°Р»РёС‡РёРµ СЂСѓР±СЂРёРєРё Рё РїСЂР°РІР° РїСѓР±Р»РёРєР°С†РёРё. /cancel вЂ” РѕС‚РјРµРЅР°.')
+            self.say('Действие не выполнено. Проверьте данные, наличие рубрики и права публикации. /cancel — отмена.')
 
     def process(self, message, action):
         text = message.get('text', '').strip()
@@ -128,30 +131,30 @@ class Controller:
             if action == 'menu':
                 return self.menu()
             if action == 'schedule':
-                return self.say('Р•Р¶РµРґРЅРµРІРЅРѕ РІ 08:00 РњРЎРљ. РџРѕСЃР»Рµ РїСЂРѕСЃС‚РѕСЏ вЂ” РѕРґРЅР° СЂР°СЃСЃС‹Р»РєР° РїСЂРё Р·Р°РїСѓСЃРєРµ РїРѕСЃР»Рµ 08:00. РџРѕСЃР»РµРґРЅРёР№ СѓСЃРїРµС€РЅС‹Р№ РґРµРЅСЊ: ' + str(self.store.get('last_daily') or 'РµС‰С‘ РЅРµС‚'))
+                return self.say('Ежедневно в 08:00 МСК. После простоя — одна рассылка при запуске после 08:00. Последний успешный день: ' + str(self.store.get('last_daily') or 'ещё нет'))
             if action == 'add':
                 self.store.put('session', {'step': 'title', 'id': uuid.uuid4().hex[:12], 'draft': {}})
-                return self.say('Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ РЅРѕРІРѕР№ СЂСѓР±СЂРёРєРё (РґРѕ 100 СЃРёРјРІРѕР»РѕРІ). /cancel вЂ” РѕС‚РјРµРЅР°.')
+                return self.say('Введите название новой рубрики (до 100 символов). /cancel — отмена.')
             if action == 'topics':
-                self.say('Р СѓР±СЂРёРєРё: ' + str(len(categories)))
+                self.say('Рубрики: ' + str(len(categories)))
                 for key, settings in categories.items():
-                    self.say(settings.get('title', key), [[('РћС‚РєСЂС‹С‚СЊ', 'topic:' + key)]])
+                    self.say(settings.get('title', key), [[('Открыть', 'topic:' + key)]])
                 return
             if action == 'targets':
-                self.say('РџРѕР»СѓС‡Р°С‚РµР»Рё: ' + str(len(targets)))
+                self.say('Получатели: ' + str(len(targets)))
                 for target in targets:
                     self.say(target.get('title', target['chat_id']) + ' (' + target['chat_id'] + ')',
-                             [[('РЈРґР°Р»РёС‚СЊ', 'deltarget:' + target['chat_id'])]])
+                             [[('Удалить', 'deltarget:' + target['chat_id'])]])
                 return
             if action == 'target':
                 self.store.put('session', {'step': 'target'})
-                rows = [[{'text': 'РњРѕР№ Р»РёС‡РЅС‹Р№ С‡Р°С‚'}], [{'text': 'Р’С‹Р±СЂР°С‚СЊ РєР°РЅР°Р»', 'request_chat': {
+                rows = [[{'text': 'Мой личный чат'}], [{'text': 'Выбрать канал', 'request_chat': {
                     'request_id': 1, 'chat_is_channel': True, 'request_title': True, 'bot_is_member': True,
                     'user_administrator_rights': admin_rights(True), 'bot_administrator_rights': admin_rights(True)}}],
-                    [{'text': 'Р’С‹Р±СЂР°С‚СЊ РіСЂСѓРїРїСѓ', 'request_chat': {'request_id': 2, 'chat_is_channel': False,
+                    [{'text': 'Выбрать группу', 'request_chat': {'request_id': 2, 'chat_is_channel': False,
                     'request_title': True, 'bot_is_member': True, 'user_administrator_rights': admin_rights(False),
                     'bot_administrator_rights': admin_rights(False)}}]]
-                return self.say('Р”РѕР±Р°РІСЊС‚Рµ Р±РѕС‚Р° Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂРѕРј, Р·Р°С‚РµРј РІС‹Р±РµСЂРёС‚Рµ С‡Р°С‚ РєРЅРѕРїРєРѕР№ РёР»Рё РѕС‚РїСЂР°РІСЊС‚Рµ С‡РёСЃР»РѕРІРѕР№ chat_id. /cancel вЂ” РѕС‚РјРµРЅР°.',
+                return self.say('Добавьте бота администратором, затем выберите чат кнопкой или отправьте числовой chat_id. /cancel — отмена.',
                                 markup={'keyboard': rows, 'resize_keyboard': True, 'one_time_keyboard': True})
             parts = action.split(':')
             verb = parts[0]
@@ -162,17 +165,17 @@ class Controller:
                 key = parts[1]
                 settings = categories[key]
                 if verb == 'topic':
-                    rows = [[('РќР°Р·РІР°РЅРёРµ', 'edit:' + key + ':title'), ('Р—Р°РїСЂРѕСЃС‹', 'edit:' + key + ':queries')],
-                            [('РљР»СЋС‡РµРІС‹Рµ СЃР»РѕРІР°', 'edit:' + key + ':keywords'), ('РџРѕР»СѓС‡Р°С‚РµР»Рё', 'assign:' + key)],
-                            [('РЈРґР°Р»РёС‚СЊ СЂСѓР±СЂРёРєСѓ', 'delete:' + key)]]
-                    return self.say(settings.get('title', key) + '\nР—Р°РїСЂРѕСЃС‹: ' + '; '.join(settings['queries']) + '\nРЎР»РѕРІР°: ' + '; '.join(settings['keywords']), rows)
+                    rows = [[('Название', 'edit:' + key + ':title'), ('Запросы', 'edit:' + key + ':queries')],
+                            [('Ключевые слова', 'edit:' + key + ':keywords'), ('Получатели', 'assign:' + key)],
+                            [('Удалить рубрику', 'delete:' + key)]]
+                    return self.say(settings.get('title', key) + '\nЗапросы: ' + '; '.join(settings['queries']) + '\nСлова: ' + '; '.join(settings['keywords']), rows)
                 if verb == 'edit':
                     if parts[2] not in ('title', 'queries', 'keywords'):
                         raise ValueError()
                     self.store.put('session', {'step': parts[2], 'id': key, 'draft': dict(settings), 'edit': True})
-                    return self.say('Р’РІРµРґРёС‚Рµ РЅРѕРІРѕРµ Р·РЅР°С‡РµРЅРёРµ. РЎРїРёСЃРєРё СЂР°Р·РґРµР»СЏР№С‚Рµ С‚РѕС‡РєРѕР№ СЃ Р·Р°РїСЏС‚РѕР№. /cancel вЂ” РѕС‚РјРµРЅР°.')
+                    return self.say('Введите новое значение. Списки разделяйте точкой с запятой. /cancel — отмена.')
                 if verb == 'delete':
-                    return self.say('РЈРґР°Р»РёС‚СЊ СЂСѓР±СЂРёРєСѓ ' + settings.get('title', key) + '?', [[('Р”Р°, СѓРґР°Р»РёС‚СЊ', 'confirm:' + key)]])
+                    return self.say('Удалить рубрику ' + settings.get('title', key) + '?', [[('Да, удалить', 'confirm:' + key)]])
                 if verb == 'confirm':
                     del categories[key]
                     for target in targets:
@@ -186,10 +189,10 @@ class Controller:
                             validate_target(self.api, target['chat_id'], self.admin)
                             target['categories'].append(key)
                         self.store.put('config', config)
-                    self.say('РџРѕР»СѓС‡Р°С‚РµР»Рё СЂСѓР±СЂРёРєРё ' + settings.get('title', key))
+                    self.say('Получатели рубрики ' + settings.get('title', key))
                     for t in targets:
-                        self.say(('вњ… ' if key in t['categories'] else 'в¬њ ') + t.get('title', t['chat_id']),
-                                 [[('РџРµСЂРµРєР»СЋС‡РёС‚СЊ', 'toggle:' + key + ':' + t['chat_id'])]])
+                        self.say(('✅ ' if key in t['categories'] else '⬜ ') + t.get('title', t['chat_id']),
+                                 [[('Переключить', 'toggle:' + key + ':' + t['chat_id'])]])
                     return
                 else:
                     raise ValueError()
@@ -202,14 +205,14 @@ class Controller:
             shared = message.get('chat_shared', {})
             if shared and shared.get('request_id') not in (1, 2):
                 raise ValueError()
-            raw = shared.get('chat_id', self.admin if text == 'РњРѕР№ Р»РёС‡РЅС‹Р№ С‡Р°С‚' else text)
+            raw = shared.get('chat_id', self.admin if text == 'Мой личный чат' else text)
             target = validate_target(self.api, raw, self.admin)
             if any(t['chat_id'] == target['chat_id'] for t in targets):
                 raise ValueError()
             targets.append(target)
             self.store.put('config', config)
             self.store.put('session', None)
-            self.say('РџРѕР»СѓС‡Р°С‚РµР»СЊ РґРѕР±Р°РІР»РµРЅ. РќР°Р·РЅР°С‡СЊС‚Рµ РµРјСѓ СЂСѓР±СЂРёРєРё С‡РµСЂРµР· В«Р СѓР±СЂРёРєРё в†’ РџРѕР»СѓС‡Р°С‚РµР»РёВ».', markup={'remove_keyboard': True})
+            self.say('Получатель добавлен. Назначьте ему рубрики через «Рубрики → Получатели».', markup={'remove_keyboard': True})
             return self.menu()
         if step == 'title':
             if not text or len(text) > 100:
@@ -228,11 +231,11 @@ class Controller:
             categories[session['id']] = session['draft']
             self.store.put('config', config)
             self.store.put('session', None)
-            self.say('Р СѓР±СЂРёРєР° СЃРѕС…СЂР°РЅРµРЅР°. Р’С‹Р±РµСЂРёС‚Рµ РґР»СЏ РЅРµС‘ РїРѕР»СѓС‡Р°С‚РµР»РµР№.')
+            self.say('Рубрика сохранена. Выберите для неё получателей.')
             return self.menu()
         session['step'] = 'queries' if step == 'title' else 'keywords'
         self.store.put('session', session)
-        self.say('Р’РІРµРґРёС‚Рµ ' + ('РїРѕРёСЃРєРѕРІС‹Рµ Р·Р°РїСЂРѕСЃС‹' if step == 'title' else 'РєР»СЋС‡РµРІС‹Рµ СЃР»РѕРІР°') + ' С‡РµСЂРµР· С‚РѕС‡РєСѓ СЃ Р·Р°РїСЏС‚РѕР№.')
+        self.say('Введите ' + ('поисковые запросы' if step == 'title' else 'ключевые слова') + ' через точку с запятой.')
 
 
 def admin_rights(channel):
@@ -278,8 +281,8 @@ def main():
         raise SystemExit('Remove the existing Telegram webhook before enabling polling')
     controller = Controller(store, api, int(raw))
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
-        ('start', 'РџР°РЅРµР»СЊ СѓРїСЂР°РІР»РµРЅРёСЏ'), ('add', 'Р”РѕР±Р°РІРёС‚СЊ СЂСѓР±СЂРёРєСѓ'), ('topics', 'Р СѓР±СЂРёРєРё Рё РЅР°Р·РЅР°С‡РµРЅРёСЏ'),
-        ('recipients', 'РџРѕР»СѓС‡Р°С‚РµР»Рё'), ('recipient', 'Р”РѕР±Р°РІРёС‚СЊ РїРѕР»СѓС‡Р°С‚РµР»СЏ'), ('schedule', 'Р Р°СЃРїРёСЃР°РЅРёРµ'), ('cancel', 'РћС‚РјРµРЅР°'))])
+        ('start', 'Панель управления'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
+        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('cancel', 'Отмена'))])
     retry_at = 0
     worker = ThreadPoolExecutor(max_workers=1)
     delivery = None

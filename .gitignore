@@ -3,3 +3,7 @@ __pycache__/
 .env
 data/
 .delivery-state/
+.deps/
+.tmp/
+patch_*.py
+*.lock

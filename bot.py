@@ -34,8 +34,8 @@ def rank_items(items, limit=5):
     return sorted(unique.values(), key=lambda item: (item['event'], item['date']), reverse=True)[:limit]
 
 
-def collect_news():
-    config = load_config()
+def collect_news(config=None):
+    config = load_config() if config is None else config
     cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
     items = []
     queries = {}
@@ -154,12 +154,12 @@ def send_message(token, chat_id, items):
         raise ValueError('Telegram delivery failed') from None
 
 
-def main():
+def main(config=None, target_validator=None):
     token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
     if not token:
         raise SystemExit('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID or TELEGRAM_TARGETS')
     try:
-        config = load_config()
+        config = load_config() if config is None else config
     except (ValueError, TypeError, OSError):
         raise SystemExit('Invalid news configuration; check categories and Telegram targets') from None
     state = Path(os.environ.get('NEWS_STATE_PATH', 'data/sent.sqlite3'))
@@ -167,9 +167,17 @@ def main():
     failed = False
     with closing(sqlite3.connect(state)) as db:
         db.execute('CREATE TABLE IF NOT EXISTS sent (chat_id TEXT, item_key TEXT, PRIMARY KEY (chat_id, item_key))')
-        items = collect_news()
+        items = collect_news() if target_validator is None else collect_news(config)
         for target in config['targets']:
             chat_id = target['chat_id']
+            if not target['categories']:
+                continue
+            if target_validator is not None:
+                try:
+                    target_validator(chat_id)
+                except ValueError:
+                    failed = True
+                    continue
             known = {row[0] for row in db.execute('SELECT item_key FROM sent WHERE chat_id = ?', (chat_id,))}
             candidates = [item for item in items
                           if set(item.get('categories', config['categories'])) & set(target['categories'])]

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   send:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && vars.INTERACTIVE_BOT_ENABLED != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

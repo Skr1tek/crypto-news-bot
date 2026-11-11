@@ -73,16 +73,22 @@ def format_digest(items):
 
 
 def main():
-    token = os.environ['TELEGRAM_BOT_TOKEN']
-    chat_id = os.environ['TELEGRAM_CHAT_ID']
+    token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+    if not token or not chat_id:
+        raise SystemExit('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Actions secrets')
     message = format_digest(collect_news())
-    response = requests.post(
-        f'https://api.telegram.org/bot{token}/sendMessage',
-        json={'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML',
-              'disable_web_page_preview': True}, timeout=30)
-    response.raise_for_status()
-    if not response.json().get('ok'):
-        raise RuntimeError('Telegram API did not confirm delivery')
+    try:
+        response = requests.post(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            json={'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML',
+                  'disable_web_page_preview': True}, timeout=30)
+        response.raise_for_status()
+        if not response.json().get('ok'):
+            raise ValueError('Delivery not confirmed')
+    except (requests.RequestException, ValueError):
+        # Request exceptions may contain the URL, which includes the bot token.
+        raise SystemExit('Telegram delivery failed; check credentials, chat access and network') from None
     print('Telegram digest delivered')
 
 

@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime, timezone
-from bot import rank_items, format_digest
+from unittest.mock import patch
+from bot import rank_items, format_digest, resolve_article_url
 
 class DigestTests(unittest.TestCase):
     def test_prioritizes_events_and_deduplicates(self):
@@ -9,6 +10,19 @@ class DigestTests(unittest.TestCase):
         ranked=rank_items(entries)
         self.assertEqual(len(ranked),2)
         self.assertTrue(ranked[0]['event'])
+
+    def test_article_url_keeps_publisher_link(self):
+        self.assertEqual(resolve_article_url('https://example.org/story'), 'https://example.org/story')
+
+    @patch('bot.gnewsdecoder')
+    def test_google_news_link_decoded(self, decoder):
+        decoder.return_value = {'status': True, 'decoded_url': 'https://publisher.example/article'}
+        self.assertEqual(resolve_article_url('https://news.google.com/rss/articles/abc'), 'https://publisher.example/article')
+
+    @patch('bot.gnewsdecoder')
+    def test_unresolved_google_news_link_is_not_sent(self, decoder):
+        decoder.return_value = {'status': False}
+        self.assertIsNone(resolve_article_url('https://news.google.com/rss/articles/abc'))
 
     def test_message_escapes_untrusted_title(self):
         item={'title':'Крипто <test> & обзор','url':'https://example.org','date':datetime.now(timezone.utc),'event':False,'source':'Test'}

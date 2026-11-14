@@ -13,6 +13,7 @@ from urllib.parse import quote, urlsplit
 
 import feedparser
 import requests
+from googlenewsdecoder import gnewsdecoder
 
 MSK = timezone(timedelta(hours=3))
 QUERIES = (
@@ -32,6 +33,29 @@ def rank_items(items, limit=5):
         if key not in unique or item['date'] > unique[key]['date']:
             unique[key] = item
     return sorted(unique.values(), key=lambda item: (item['event'], item['date']), reverse=True)[:limit]
+
+
+def resolve_article_url(link):
+    """Return a publisher URL, never a Google News intermediary."""
+    parsed = urlsplit(link)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower().rstrip('.')
+    if host not in ('news.google.com', 'google.com', 'www.google.com'):
+        return link
+    try:
+        result = gnewsdecoder(link, interval=0)
+        candidate = result.get('decoded_url') if isinstance(result, dict) and result.get('status') else None
+        parsed = urlsplit(candidate or '')
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return None
+        host = parsed.hostname.lower().rstrip('.')
+        if host in ('news.google.com', 'google.com', 'www.google.com'):
+            return None
+        return candidate
+    except Exception:
+        # Decoder depends on Google's undocumented URL format; fail closed.
+        return None
 
 
 def collect_news():
@@ -66,7 +90,11 @@ def collect_news():
                               for word in config['categories'][name]['keywords'])]
             if date < cutoff or not matched:
                 continue
-            items.append({'title': title, 'url': link, 'date': date,
+            article_url = resolve_article_url(link)
+            if not article_url:
+                print('Skipping unresolved Google News article')
+                continue
+            items.append({'title': title, 'url': article_url, 'date': date,
                           'categories': matched,
                           'event': any(word in title.casefold() for word in EVENT_WORDS),
                           'source': entry.get('source', {}).get('title', 'Новостная публикация')})

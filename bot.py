@@ -142,6 +142,13 @@ DEFAULT_CATEGORIES = {
 }
 
 
+def get_news_limit(config):
+    value = config.get('news_limit', 5)
+    if type(value) is not int or not 1 <= value <= 50:
+        raise ValueError('news_limit must be an integer from 1 to 50')
+    return value
+
+
 def load_config():
     path = os.environ.get('NEWS_CONFIG_PATH', '').strip()
     config = json.loads(Path(path).read_text(encoding='utf-8')) if path else {}
@@ -178,7 +185,7 @@ def load_config():
             raise ValueError('Unknown or empty target categories')
         normalized.append({'chat_id': chat_id, 'categories': selected})
         seen.add(chat_id)
-    return {'categories': categories, 'targets': normalized}
+    return {'categories': categories, 'targets': normalized, 'news_limit': get_news_limit(config)}
 
 
 def item_keys(item):
@@ -209,6 +216,7 @@ def main(config=None, target_validator=None):
         raise SystemExit('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID or TELEGRAM_TARGETS')
     try:
         config = load_config() if config is None else config
+        limit = get_news_limit(config)
     except (ValueError, TypeError, OSError):
         raise SystemExit('Invalid news configuration; check categories and Telegram targets') from None
     state = Path(os.environ.get('NEWS_STATE_PATH', 'data/sent.sqlite3'))
@@ -235,7 +243,7 @@ def main(config=None, target_validator=None):
             candidates = [item for item in items
                           if set(item.get('categories', config['categories'])) & set(target['categories'])]
             recent = list(db.execute('SELECT title, published FROM stories WHERE chat_id=?', (chat_id,)))
-            # Match recent confirmed stories before filling the five-story limit.
+            # Match recent confirmed stories before filling the configured story limit.
             fresh = []
             for item in rank_items(candidates, limit=None):
                 aliases = item.get('_aliases', [item])
@@ -245,7 +253,7 @@ def main(config=None, target_validator=None):
                 if not known.intersection(keys) and not seen_story:
                     fresh.append(item)
                     known.update(keys)
-                if len(fresh) == 5:
+                if len(fresh) == limit:
                     break
             if not fresh and items:
                 print('No new matching news for target', chat_id)

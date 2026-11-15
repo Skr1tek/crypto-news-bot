@@ -205,7 +205,8 @@ class Controller:
 
     def menu(self):
         self.say('Панель управления новостями', [[('➕ Добавить тему', 'add'), ('📋 Рубрики', 'topics')],
-                 [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule'), ('📰 Срез новостей сейчас', 'now')]])
+                 [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule'), ('📰 Срез новостей сейчас', 'now')],
+                 [('🔢 Количество новостей', 'limit')]])
 
     def handle(self, update):
         callback = update.get('callback_query')
@@ -223,17 +224,22 @@ class Controller:
     def process(self, message, action):
         text = message.get('text', '').strip()
         commands = {'/start': 'menu', '/help': 'menu', '/topics': 'topics', '/add': 'add',
-                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/cancel': 'menu'}
+                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/cancel': 'menu'}
         if text.startswith('/'):
             action = commands.get(text.split('@')[0], 'menu')
         config = self.store.config()
         categories, targets = config['categories'], config['targets']
         session = self.store.get('session')
         if action:
-            if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now'):
+            if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now', 'limit'):
                 self.store.put('session', None)
             if action == 'menu':
                 return self.menu()
+            if action == 'limit':
+                self.store.put('session', {'step': 'limit'})
+                return self.say('Сейчас до ' + str(bot.get_news_limit(config)) +
+                    ' новостей за один срез для каждого получателя, суммарно по его рубрикам. '
+                    'Введите число от 1 до 50. Это максимум: повторов и неподходящих новостей не добавляем. /cancel — отмена.')
             if action == 'schedule':
                 schedule = self.store.get('schedule')
                 times = ['08:00'] if schedule is None else schedule
@@ -325,6 +331,13 @@ class Controller:
         if not session:
             return self.menu()
         step = session['step']
+        if step == 'limit':
+            if not re.fullmatch(r'[0-9]{1,2}', text) or not 1 <= int(text) <= 50:
+                return self.say('Введите целое число от 1 до 50. /cancel — отмена.')
+            config['news_limit'] = int(text)
+            self.store.put('config', config)
+            self.store.put('session', None)
+            return self.say('Сохранено: до ' + text + ' новостей каждому получателю за один запуск. Применяется к расписанию и срезу сейчас.')
         if step == 'schedule':
             try:
                 times = parse_schedule(text)
@@ -414,7 +427,7 @@ def main():
     controller = Controller(store, api, int(raw))
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
         ('start', 'Панель управления'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
-        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('cancel', 'Отмена'))])
+        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('cancel', 'Отмена'))])
     worker = ThreadPoolExecutor(max_workers=1)
     runner = DeliveryRunner(store, api, int(raw), worker)
     while True:

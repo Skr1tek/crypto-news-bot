@@ -13,6 +13,7 @@ from urllib.parse import quote, urlsplit
 
 import feedparser
 import requests
+from links import publisher_url, safe_article_url
 
 MSK = timezone(timedelta(hours=3))
 QUERIES = (
@@ -228,6 +229,9 @@ def main(config=None, target_validator=None):
         db.execute('CREATE TABLE IF NOT EXISTS stories (chat_id TEXT, title TEXT, published REAL, PRIMARY KEY (chat_id, title))')
         db.execute('DELETE FROM stories WHERE published < ?', ((datetime.now(timezone.utc) - timedelta(days=7)).timestamp(),))
         db.commit()
+        db.execute('CREATE TABLE IF NOT EXISTS article_links (original TEXT PRIMARY KEY, publisher TEXT NOT NULL)')
+        db.commit()
+        resolved = {}
         items = collect_news() if target_validator is None else collect_news(config)
         for target in config['targets']:
             chat_id = target['chat_id']
@@ -251,8 +255,29 @@ def main(config=None, target_validator=None):
                 seen_story = any(abs(item['date'].timestamp() - stamp) <= 72 * 3600
                                  and same_story(item['title'], title) for title, stamp in recent)
                 if not known.intersection(keys) and not seen_story:
-                    fresh.append(item)
-                    known.update(keys)
+                    chosen = None
+                    for alias in aliases:
+                        original = alias['url']
+                        if original not in resolved:
+                            cached = db.execute('SELECT publisher FROM article_links WHERE original=?', (original,)).fetchone()
+                            direct = cached[0] if cached and safe_article_url(cached[0]) else publisher_url(original)
+                            resolved[original] = direct
+                            if direct:
+                                db.execute('INSERT OR REPLACE INTO article_links VALUES (?, ?)', (original, direct))
+                                db.commit()
+                        if resolved[original]:
+                            chosen = dict(item, url=resolved[original])
+                            chosen['_aliases'] = aliases + [dict(alias, url=resolved[original])]
+                            break
+                    if chosen is None:
+                        failed = True
+                        print('Publisher article URL unavailable; story skipped')
+                        continue
+                    chosen_keys = {key for alias in chosen['_aliases'] for key in item_keys(alias)}
+                    if known.intersection(chosen_keys):
+                        continue
+                    fresh.append(chosen)
+                    known.update(chosen_keys)
                 if len(fresh) == limit:
                     break
             if not fresh and items:

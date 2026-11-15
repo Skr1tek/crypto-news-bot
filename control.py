@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 import requests
 import bot
+import assistant_api
 
 
 class Store:
@@ -196,8 +197,11 @@ def buttons(rows):
 
 
 class Controller:
-    def __init__(self, store, api, admin):
+    def __init__(self, store, api, admin, ai_worker=None):
         self.store, self.api, self.admin = store, api, admin
+        self.ai_worker = ai_worker
+        self.ai_future = None
+        self.ai_cancelled = False
 
     def say(self, text, rows=None, markup=None):
         self.api('sendMessage', chat_id=self.admin, text=text,
@@ -206,7 +210,59 @@ class Controller:
     def menu(self):
         self.say('Панель управления новостями', [[('➕ Добавить тему', 'add'), ('📋 Рубрики', 'topics')],
                  [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule'), ('📰 Срез новостей сейчас', 'now')],
-                 [('🔢 Количество новостей', 'limit')]])
+                 [('🔢 Количество новостей', 'limit'), ('🤖 ИИ-помощник', 'ai')]])
+
+    def start_ai(self, text):
+        if not os.environ.get('OPENROUTER_API_KEY') or not os.environ.get('OPENROUTER_MODEL') or self.ai_worker is None:
+            return self.say('Для ИИ нужны OPENROUTER_API_KEY и OPENROUTER_MODEL в защищённых настройках сервера. Ключ в Telegram не отправляйте.')
+        if self.ai_future is not None:
+            return self.say('ИИ ещё отвечает на предыдущий запрос. Подождите или /cancel — отмена результата.')
+        if not 1 <= len(text) <= 3000:
+            return self.say('Отправьте запрос длиной до 3000 символов.')
+        day = datetime.now(bot.MSK).date().isoformat()
+        usage = self.store.get('ai_usage') or {}
+        count = usage.get('count', 0) if usage.get('day') == day else 0
+        if count >= 30:
+            return self.say('Достигнут лимит 30 запросов ИИ за день по МСК.')
+        clean = assistant_api.redact(text)
+        if clean != text:
+            return self.say('В сообщении обнаружен секрет. Запрос не отправлен. Удалите токены и повторите.')
+        self.ai_context = assistant_api.context(self.store.config(), self.store.get('schedule'), clean)
+        self.ai_text = clean
+        self.ai_cancelled = False
+        self.store.put('ai_draft', None)
+        self.store.put('ai_usage', {'day': day, 'count': count + 1})
+        self.ai_future = self.ai_worker.submit(assistant_api.ask, clean, self.ai_context, self.store.get('ai_history') or [])
+        self.say('ИИ готовит ответ. Запрос, краткая история и настройки рубрик передаются OpenRouter; для вопросов по коду — также исходники бота без файлов секретов. /cancel — отмена результата.')
+
+    def tick_ai(self):
+        if self.ai_future is None or not self.ai_future.done():
+            return
+        future, self.ai_future = self.ai_future, None
+        if self.ai_cancelled:
+            return
+        try:
+            result = assistant_api.validate_proposal(future.result(), self.ai_context)
+        except (ValueError, Exception):
+            return self.say('ИИ не смог ответить. Проверьте ключ, баланс и поддержку JSON Schema выбранной моделью OpenRouter. Настройки не изменены.')
+        history = (self.store.get('ai_history') or []) + [
+            {'role': 'user', 'content': self.ai_text},
+            {'role': 'assistant', 'content': assistant_api.redact(result['reply'])}]
+        self.store.put('ai_history', history[-6:])
+        for start in range(0, len(result['reply']), 1800):
+            self.say(assistant_api.redact(result['reply'][start:start + 1800]))
+        if result['action'] != 'advice':
+            nonce = uuid.uuid4().hex[:12]
+            original = self.ai_context['categories'].get(result['topic_id'])
+            self.store.put('ai_draft', {'nonce': nonce, 'created': time.time(), 'result': result, 'original': original})
+            preview = ('Предложение: ' + ('создать' if result['action'] == 'create_topic' else 'изменить') +
+                ' рубрику «' + result['title'] + '»\nЗапросы: ' + ', '.join(result['queries']) +
+                '\nКлючевые слова: ' + ', '.join(result['keywords']))
+            for start in range(0, len(preview), 1800):
+                self.say(preview[start:start + 1800])
+            self.say('Сохранить предложение?',
+                [[('Сохранить рубрику', 'ai_apply:' + nonce), ('Отклонить', 'ai_reject')]])
+
 
     def handle(self, update):
         callback = update.get('callback_query')
@@ -223,18 +279,55 @@ class Controller:
 
     def process(self, message, action):
         text = message.get('text', '').strip()
+        if text == '/cancel':
+            self.ai_cancelled = True
+            self.store.put('ai_mode', False)
+            self.store.put('ai_draft', None)
         commands = {'/start': 'menu', '/help': 'menu', '/topics': 'topics', '/add': 'add',
-                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/cancel': 'menu'}
+                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/ai': 'ai', '/cancel': 'menu'}
         if text.startswith('/'):
             action = commands.get(text.split('@')[0], 'menu')
         config = self.store.config()
         categories, targets = config['categories'], config['targets']
         session = self.store.get('session')
         if action:
-            if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now', 'limit'):
+            if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now', 'limit', 'ai'):
                 self.store.put('session', None)
             if action == 'menu':
+                self.store.put('ai_mode', False)
                 return self.menu()
+            if action == 'ai':
+                self.store.put('ai_mode', True)
+                return self.say('Напишите обычным сообщением, например: «Добавь рубрику Банкротства банков с запросами и ключевыми словами» или «Что улучшить в коде?». '
+                    'ИИ предлагает изменения рубрик с подтверждением. Код он только обсуждает, не выполняет и не редактирует. '
+                    'Запросы и контекст передаются OpenRouter. /cancel — выйти.', [[('Очистить историю ИИ', 'ai_clear'), ('Меню', 'menu')]])
+            if action == 'ai_clear':
+                self.ai_cancelled = True
+                self.store.put('ai_history', [])
+                self.store.put('ai_draft', None)
+                return self.say('История ИИ и несохранённое предложение удалены из бота.')
+            if action == 'ai_reject':
+                self.store.put('ai_draft', None)
+                return self.say('Предложение отклонено.')
+            if action.startswith('ai_apply:'):
+                draft = self.store.get('ai_draft')
+                if not draft or draft['nonce'] != action.split(':')[1] or time.time() - draft['created'] > 600:
+                    return self.say('Предложение устарело. Запросите новое у ИИ.')
+                result = assistant_api.validate_proposal(draft['result'], config)
+                if result['action'] == 'advice':
+                    raise ValueError()
+                if result['action'] == 'create_topic':
+                    if len(categories) >= 50 or any(c.get('title', key).casefold() == result['title'].casefold() for key, c in categories.items()):
+                        return self.say('Рубрика с таким названием уже есть или достигнут лимит рубрик.')
+                    key = uuid.uuid4().hex[:12]
+                else:
+                    key = result['topic_id']
+                    if categories.get(key) != draft['original']:
+                        return self.say('Рубрика изменилась после запроса ИИ. Запросите новое предложение.')
+                categories[key] = dict(categories.get(key, {}), **{field: result[field] for field in ('title', 'queries', 'keywords')})
+                self.store.put('config', config)
+                self.store.put('ai_draft', None)
+                return self.say('Рубрика сохранена. Получателей выберите в «Рубрики → Получатели».')
             if action == 'limit':
                 self.store.put('session', {'step': 'limit'})
                 return self.say('Сейчас до ' + str(bot.get_news_limit(config)) +
@@ -329,6 +422,8 @@ class Controller:
             self.store.put('config', config)
             return self.menu()
         if not session:
+            if text and self.store.get('ai_mode'):
+                return self.start_ai(text)
             return self.menu()
         step = session['step']
         if step == 'limit':
@@ -424,15 +519,17 @@ def main():
     api = Telegram(token)
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove the existing Telegram webhook before enabling polling')
-    controller = Controller(store, api, int(raw))
+    ai_worker = ThreadPoolExecutor(max_workers=1)
+    controller = Controller(store, api, int(raw), ai_worker)
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
         ('start', 'Панель управления'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
-        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('cancel', 'Отмена'))])
+        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('cancel', 'Отмена'))])
     worker = ThreadPoolExecutor(max_workers=1)
     runner = DeliveryRunner(store, api, int(raw), worker)
     while True:
         try:
             runner.tick(datetime.now(timezone.utc))
+            controller.tick_ai()
             updates = api('getUpdates', offset=store.get('offset') or 0, timeout=20,
                           allowed_updates=['message', 'callback_query'])
             for update in updates:

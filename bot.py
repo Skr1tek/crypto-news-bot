@@ -126,7 +126,8 @@ def collect_news(config=None):
 
 def format_digest(items):
     today = datetime.now(MSK).strftime('%d.%m.%Y')
-    lines = [f'📰 <b>Криптообзор — {today}</b>', '']
+    title = items[0].get('_rubric', 'Криптообзор') if items else 'Криптообзор'
+    lines = [f'📰 <b>{html.escape(title[:100])} — {today}</b>', '']
     if not items:
         lines.append('За последние 48 часов подходящих публикаций не найдено.')
     for index, item in enumerate(items, 1):
@@ -276,21 +277,31 @@ def main(config=None, target_validator=None):
                     chosen_keys = {key for alias in chosen['_aliases'] for key in item_keys(alias)}
                     if known.intersection(chosen_keys):
                         continue
+                    rubric = next(c for c in target['categories'] if c in chosen.get('categories', config['categories']))
+                    defaults = {'regulation': 'Крипторегулирование', 'cryptobanks': 'Криптобанки', 'cfa': 'ЦФА', 'events': 'Мероприятия'}
+                    chosen['_rubric_id'] = rubric
+                    chosen['_rubric'] = config['categories'][rubric].get('title', defaults.get(rubric, rubric))
                     fresh.append(chosen)
                     known.update(chosen_keys)
                 if len(fresh) == limit:
                     break
-            if not fresh and items:
+            if not fresh:
                 print('No new matching news for target', chat_id)
                 continue
             # Batches stay below Telegram's message limit even with long links.
-            batches, batch = [], []
+            groups = {}
             for item in fresh:
-                if batch and len(format_digest(batch + [item]).encode('utf-16-le')) // 2 > 4000:
+                groups.setdefault(item['_rubric_id'], []).append(item)
+            batches = []
+            for group in groups.values():
+                batch = []
+                for item in group:
+                    if batch and len(format_digest(batch + [item]).encode('utf-16-le')) // 2 > 4000:
+                        batches.append(batch)
+                        batch = []
+                    batch.append(item)
+                if batch:
                     batches.append(batch)
-                    batch = []
-                batch.append(item)
-            batches.append(batch)
             for batch in batches:
                 try:
                     send_message(token, chat_id, batch)

@@ -214,6 +214,7 @@ def main(config=None, target_validator=None):
     state = Path(os.environ.get('NEWS_STATE_PATH', 'data/sent.sqlite3'))
     state.parent.mkdir(parents=True, exist_ok=True)
     failed = False
+    delivered = 0
     with closing(sqlite3.connect(state)) as db:
         db.execute('CREATE TABLE IF NOT EXISTS sent (chat_id TEXT, item_key TEXT, PRIMARY KEY (chat_id, item_key))')
         db.execute('CREATE TABLE IF NOT EXISTS stories (chat_id TEXT, title TEXT, published REAL, PRIMARY KEY (chat_id, title))')
@@ -270,9 +271,12 @@ def main(config=None, target_validator=None):
                         db.execute('INSERT OR REPLACE INTO stories VALUES (?, ?, ?)',
                                    (chat_id, alias['title'], alias['date'].timestamp()))
                 db.commit()
+                delivered += len(batch)
                 print('Telegram digest delivered')
     if failed:
         raise SystemExit('Telegram delivery failed; check credentials, chat access and network') from None
+
+    return delivered
 
 
 if __name__ == '__main__':

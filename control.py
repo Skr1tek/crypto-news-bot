@@ -111,9 +111,84 @@ def validate_target(api, raw, admin):
     return {'chat_id': str(chat_id), 'title': chat.get('title', chat.get('first_name', str(chat_id))), 'categories': []}
 
 
-def due(now, last):
+def parse_schedule(text):
+    values = sorted(set(v.strip() for v in re.split(r'[,;\n]', text) if v.strip()))
+    if not values or len(values) > 12 or any(not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]', v) for v in values):
+        raise ValueError('Введите время в формате 08:00, 12:00 (до 12 запусков в сутки).')
+    return values
+
+
+def due_slot(now, last, schedule):
     local = now.astimezone(bot.MSK)
-    return local.hour >= 8 and local.date().isoformat() != last
+    passed = [local.date().isoformat() + ' ' + t for t in schedule if t <= local.strftime('%H:%M')]
+    latest = max(passed) if passed else None
+    return latest if latest and (last is None or latest > last) else None
+
+
+def due(now, last):
+    # Backward-compatible helper for the original single daily schedule.
+    return due_slot(now, last + ' 08:00' if last else None, ['08:00']) is not None
+
+
+def field_prompt(field):
+    if field == 'title':
+        return 'Введите название рубрики (до 100 символов). /cancel — отмена.'
+    if field == 'queries':
+        return ('Введите поисковые запросы через запятую. Каждый запрос — отдельный поиск в Google News. '
+                'Пример: банкротство банков, отзыв лицензии банка. /cancel — отмена.')
+    return ('Введите ключевые слова через запятую. Они фильтруют найденные заголовки: достаточно совпадения одного слова или части слова. '
+            'Пример: банкрот, лиценз, АСВ. /cancel — отмена.')
+
+
+class DeliveryRunner:
+    """One worker serializes manual and scheduled sends using existing history."""
+    def __init__(self, store, api, admin, worker):
+        self.store, self.api, self.admin, self.worker = store, api, admin, worker
+        self.future = None
+        self.job = None
+        self.retry_at = 0
+        if self.store.get('last_slot') is None and self.store.get('last_daily'):
+            self.store.put('last_slot', self.store.get('last_daily') + ' 08:00')
+
+    def notify(self, text):
+        try:
+            self.api('sendMessage', chat_id=self.admin, text=text)
+        except TelegramError:
+            print('Could not send delivery status to administrator')
+
+    def tick(self, now):
+        if self.future is not None and self.future.done():
+            kind, identity = self.job
+            try:
+                count = self.future.result()
+            except (SystemExit, Exception):
+                print('Delivery incomplete; confirmed messages remain in history')
+                if kind == 'manual':
+                    self.notify('Срез выполнен не полностью. Проверьте права получателей и повторите: уже отправленные новости не повторятся.')
+                else:
+                    self.retry_at = time.monotonic() + 300
+            else:
+                if kind == 'scheduled':
+                    self.store.put('last_slot', identity)
+                else:
+                    self.notify('Срез завершён. Отправлено новостей: ' + str(count) if count else
+                                'Новых неотправленных новостей для назначенных получателей не найдено.')
+            if kind == 'manual' and self.store.get('manual_request') == identity:
+                self.store.put('manual_request', None)
+            self.future = None
+        if self.future is not None:
+            return
+        request = self.store.get('manual_request')
+        schedule = self.store.get('schedule')
+        slot = due_slot(now, self.store.get('last_slot'), ['08:00'] if schedule is None else schedule)
+        if request:
+            self.job = ('manual', request)
+        elif slot and time.monotonic() >= self.retry_at:
+            self.job = ('scheduled', slot)
+        else:
+            return
+        self.future = self.worker.submit(bot.main, config=self.store.config(),
+            target_validator=lambda chat: validate_target(self.api, chat, self.admin))
 
 
 def buttons(rows):
@@ -130,7 +205,7 @@ class Controller:
 
     def menu(self):
         self.say('Панель управления новостями', [[('➕ Добавить тему', 'add'), ('📋 Рубрики', 'topics')],
-                 [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule')]])
+                 [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule'), ('📰 Срез новостей сейчас', 'now')]])
 
     def handle(self, update):
         callback = update.get('callback_query')
@@ -148,19 +223,39 @@ class Controller:
     def process(self, message, action):
         text = message.get('text', '').strip()
         commands = {'/start': 'menu', '/help': 'menu', '/topics': 'topics', '/add': 'add',
-                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/cancel': 'menu'}
+                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/cancel': 'menu'}
         if text.startswith('/'):
             action = commands.get(text.split('@')[0], 'menu')
         config = self.store.config()
         categories, targets = config['categories'], config['targets']
         session = self.store.get('session')
         if action:
-            if action in ('menu', 'topics', 'targets', 'add', 'target'):
+            if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now'):
                 self.store.put('session', None)
             if action == 'menu':
                 return self.menu()
             if action == 'schedule':
-                return self.say('Ежедневно в 08:00 МСК. После простоя — одна рассылка при запуске после 08:00. Последний успешный день: ' + str(self.store.get('last_daily') or 'ещё нет'))
+                schedule = self.store.get('schedule')
+                times = ['08:00'] if schedule is None else schedule
+                return self.say('Рассылка по МСК: ' + (', '.join(times) if times else 'выключена') +
+                    '. После простоя выполняется последний пропущенный запуск за текущий день.',
+                    [[('Изменить время', 'schedule_edit'), ('Выключить расписание', 'schedule_off')]])
+            if action == 'schedule_edit':
+                self.store.put('session', {'step': 'schedule'})
+                return self.say('Введите время по МСК через запятую: например, 08:00, 12:00. /cancel — отмена.')
+            if action == 'schedule_off':
+                self.store.put('schedule', [])
+                return self.say('Автоматическая рассылка выключена. Срез вручную доступен.')
+            if action == 'now':
+                return self.say('Собрать свежие новости и отправить назначенным получателям? История повторов учитывается.',
+                                [[('Сделать и отправить сейчас', 'sendnow'), ('Отмена', 'menu')]])
+            if action == 'sendnow':
+                if self.store.get('manual_request'):
+                    return self.say('Срез уже выполняется или ожидает завершения текущей рассылки.')
+                if not any(t['categories'] for t in targets):
+                    return self.say('Сначала добавьте получателя и назначьте ему хотя бы одну рубрику.')
+                self.store.put('manual_request', uuid.uuid4().hex)
+                return self.say('Срез поставлен в очередь. Сообщу о завершении; это может занять несколько минут.')
             if action == 'add':
                 self.store.put('session', {'step': 'title', 'id': uuid.uuid4().hex[:12], 'draft': {}})
                 return self.say('Введите название новой рубрики (до 100 символов). /cancel — отмена.')
@@ -197,12 +292,12 @@ class Controller:
                     rows = [[('Название', 'edit:' + key + ':title'), ('Запросы', 'edit:' + key + ':queries')],
                             [('Ключевые слова', 'edit:' + key + ':keywords'), ('Получатели', 'assign:' + key)],
                             [('Удалить рубрику', 'delete:' + key)]]
-                    return self.say(settings.get('title', key) + '\nЗапросы: ' + '; '.join(settings['queries']) + '\nСлова: ' + '; '.join(settings['keywords']), rows)
+                    return self.say(settings.get('title', key) + '\nЗапросы: ' + ', '.join(settings['queries']) + '\nСлова: ' + ', '.join(settings['keywords']), rows)
                 if verb == 'edit':
                     if parts[2] not in ('title', 'queries', 'keywords'):
                         raise ValueError()
                     self.store.put('session', {'step': parts[2], 'id': key, 'draft': dict(settings), 'edit': True})
-                    return self.say('Введите новое значение. Списки разделяйте точкой с запятой. /cancel — отмена.')
+                    return self.say(field_prompt(parts[2]))
                 if verb == 'delete':
                     return self.say('Удалить рубрику ' + settings.get('title', key) + '?', [[('Да, удалить', 'confirm:' + key)]])
                 if verb == 'confirm':
@@ -230,6 +325,14 @@ class Controller:
         if not session:
             return self.menu()
         step = session['step']
+        if step == 'schedule':
+            try:
+                times = parse_schedule(text)
+            except ValueError as exc:
+                return self.say(str(exc))
+            self.store.put('schedule', times)
+            self.store.put('session', None)
+            return self.say('Расписание сохранено: ' + ', '.join(times) + ' МСК.')
         if step == 'target':
             shared = message.get('chat_shared', {})
             if shared and shared.get('request_id') not in (1, 2):
@@ -248,7 +351,7 @@ class Controller:
                 raise ValueError()
             value = text
         else:
-            value = [v.strip() for v in text.split(';') if v.strip()]
+            value = [v.strip() for v in re.split(r'[,;\n]', text) if v.strip()]
             if not value or len(value) > 20 or any(len(v) > 200 for v in value):
                 raise ValueError()
         session['draft'][step] = value
@@ -264,7 +367,7 @@ class Controller:
             return self.menu()
         session['step'] = 'queries' if step == 'title' else 'keywords'
         self.store.put('session', session)
-        self.say('Введите ' + ('поисковые запросы' if step == 'title' else 'ключевые слова') + ' через точку с запятой.')
+        self.say(field_prompt(session['step']))
 
 
 def admin_rights(channel):
@@ -311,26 +414,12 @@ def main():
     controller = Controller(store, api, int(raw))
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
         ('start', 'Панель управления'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
-        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('cancel', 'Отмена'))])
-    retry_at = 0
+        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('cancel', 'Отмена'))])
     worker = ThreadPoolExecutor(max_workers=1)
-    delivery = None
-    delivery_day = None
+    runner = DeliveryRunner(store, api, int(raw), worker)
     while True:
         try:
-            now = datetime.now(timezone.utc)
-            if delivery is not None and delivery.done():
-                try:
-                    delivery.result()
-                    store.put('last_daily', delivery_day)
-                except (SystemExit, ValueError, requests.RequestException):
-                    print('Daily delivery incomplete; retry in five minutes')
-                    retry_at = time.monotonic() + 300
-                delivery = None
-            if delivery is None and due(now, store.get('last_daily')) and time.monotonic() >= retry_at:
-                delivery_day = now.astimezone(bot.MSK).date().isoformat()
-                delivery = worker.submit(bot.main, config=store.config(),
-                    target_validator=lambda chat: validate_target(api, chat, int(raw)))
+            runner.tick(datetime.now(timezone.utc))
             updates = api('getUpdates', offset=store.get('offset') or 0, timeout=20,
                           allowed_updates=['message', 'callback_query'])
             for update in updates:

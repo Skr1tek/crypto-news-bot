@@ -7,3 +7,6 @@ data/
 .tmp/
 patch_*.py
 *.lock
+
+.fed-browser/
+work-fedresurs.html

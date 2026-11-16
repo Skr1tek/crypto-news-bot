@@ -13,10 +13,12 @@ from datetime import datetime, timezone
 import requests
 import bot
 import assistant_api
+import fedmonitor
 
 
 class Store:
     def __init__(self, path, initial):
+        self.path = str(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.execute('PRAGMA busy_timeout=5000')
@@ -210,7 +212,8 @@ class Controller:
     def menu(self):
         self.say('Панель управления новостями', [[('➕ Добавить тему', 'add'), ('📋 Рубрики', 'topics')],
                  [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule'), ('📰 Срез новостей сейчас', 'now')],
-                 [('🔢 Количество новостей', 'limit'), ('🤖 ИИ-помощник', 'ai')]])
+                 [('🔢 Количество новостей', 'limit'), ('🤖 ИИ-помощник', 'ai')],
+                 [('🏢 Мониторинг Федресурса', 'fed_menu')]])
 
     def start_ai(self, text):
         if not os.environ.get('OPENROUTER_API_KEY') or not os.environ.get('OPENROUTER_MODEL') or self.ai_worker is None:
@@ -284,18 +287,95 @@ class Controller:
             self.store.put('ai_mode', False)
             self.store.put('ai_draft', None)
         commands = {'/start': 'menu', '/help': 'menu', '/topics': 'topics', '/add': 'add',
-                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/ai': 'ai', '/cancel': 'menu'}
+                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/ai': 'ai', '/fed': 'fed_menu', '/fedadd': 'fed_add', '/fednow': 'fed_now', '/cancel': 'menu'}
+        fed_argument = None
         if text.startswith('/'):
-            action = commands.get(text.split('@')[0], 'menu')
+            pieces = text.split(maxsplit=1)
+            command = pieces[0].split('@')[0]
+            action = commands.get(command, 'menu')
+            if command == '/fedadd' and len(pieces) == 2:
+                fed_argument = pieces[1].strip()
         config = self.store.config()
         categories, targets = config['categories'], config['targets']
         session = self.store.get('session')
+        if fed_argument is not None:
+            session = {'step': 'fed_inn'}
+            self.store.put('session', session)
+            text = fed_argument
+            action = None
         if action:
-            if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now', 'limit', 'ai'):
+            if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now', 'limit', 'ai', 'fed_menu', 'fed_add', 'fed_now'):
                 self.store.put('session', None)
             if action == 'menu':
                 self.store.put('ai_mode', False)
                 return self.menu()
+            if action == 'fed_menu':
+                self.store.put('fed_pending', None)
+                status = self.store.get('fed_status') or {}
+                return self.say('Мониторинг Федресурса: компании по ИНН. Проверка каждые 15 минут, только текущий день по МСК. '
+                    'При добавлении получатель — ваш личный чат.\nПоследняя проверка: ' + str(status.get('checked_at', 'ещё не выполнялась')) +
+                    ('\nЕсть ошибки проверки: ' + '; '.join(status['errors'])[:1400] if status.get('errors') else ''),
+                    [[('Добавить лицо', 'fed_add'), ('Список компаний', 'fed_list')], [('Проверить сегодня', 'fed_now')]])
+            if action == 'fed_add':
+                self.store.put('session', {'step': 'fed_inn'})
+                return self.say('Введите 10-значный ИНН юридического лица, например 7831000108. Сейчас поддерживаются компании, не физические лица. /cancel — отмена.')
+            if action == 'fed_list':
+                watches = self.store.get('fed_watch') or {}
+                self.say('На мониторинге компаний: ' + str(len(watches)))
+                for inn, watch in watches.items():
+                    self.say(watch['name'] + '\nИНН ' + inn + '\nПолучателей: ' + str(len(watch['targets'])),
+                        [[('Получатели', 'fed_targets:' + inn), ('Снять с мониторинга', 'fed_delete:' + inn)]])
+                return
+            if action == 'fed_now':
+                if not self.store.get('fed_watch'):
+                    return self.say('Сначала добавьте компанию на мониторинг.')
+                if self.store.get('fed_manual'):
+                    return self.say('Проверка уже ожидается. Дождитесь результата.')
+                self.store.put('fed_manual', uuid.uuid4().hex)
+                return self.say('Проверка за текущий день поставлена в очередь. После завершения сообщу результат. Повторы не отправляются.')
+            if action.startswith('fed_confirm:'):
+                pending = self.store.get('fed_pending')
+                if not pending or pending['nonce'] != action.split(':')[1] or time.time() - pending['created'] > 600:
+                    return self.say('Подтверждение устарело. Добавьте ИНН заново.')
+                watches = self.store.get('fed_watch') or {}
+                if len(watches) >= 20 or pending['inn'] in watches:
+                    return self.say('Компания уже добавлена или достигнут лимит 20 компаний.')
+                watches[pending['inn']] = {k: pending[k] for k in ('inn', 'name', 'guid', 'targets')}
+                self.store.put('fed_watch', watches)
+                self.store.put('fed_pending', None)
+                self.store.put('fed_last_poll', 0)
+                return self.say('Компания добавлена. Проверка сегодняшних сообщений начнётся автоматически; получатель — ваш личный чат.')
+            if action.startswith('fed_delete:'):
+                inn = action.split(':')[1]
+                watch = (self.store.get('fed_watch') or {})[inn]
+                return self.say('Снять с мониторинга ' + watch['name'] + '?', [[('Да, снять', 'fed_remove:' + inn), ('Отмена', 'fed_menu')]])
+            if action.startswith('fed_remove:'):
+                watches = self.store.get('fed_watch') or {}
+                del watches[action.split(':')[1]]
+                self.store.put('fed_watch', watches)
+                return self.say('Компания снята с мониторинга. История доставленных сообщений сохранена.')
+            if action.startswith(('fed_targets:', 'fed_toggle:')):
+                parts = action.split(':')
+                watches = self.store.get('fed_watch') or {}
+                watch = watches[parts[1]]
+                choices = {str(self.admin): 'Мой личный чат'}
+                choices.update({t['chat_id']: t.get('title', t['chat_id']) for t in targets})
+                if parts[0] == 'fed_toggle':
+                    chat = parts[2]
+                    if chat not in choices:
+                        raise ValueError()
+                    if chat in watch['targets']:
+                        watch['targets'].remove(chat)
+                    else:
+                        validate_target(self.api, chat, self.admin)
+                        watch['targets'].append(chat)
+                    self.store.put('fed_watch', watches)
+                    self.store.put('fed_last_poll', 0)
+                self.say('Получатели Федресурса: ' + watch['name'] + '. Пустой список отключает отправку. Новые чаты добавляются через общее меню «Получатели».')
+                for chat, title in choices.items():
+                    self.say(('✅ ' if chat in watch['targets'] else '⬜ ') + title,
+                        [[('Переключить', 'fed_toggle:' + parts[1] + ':' + chat)]])
+                return
             if action == 'ai':
                 self.store.put('ai_mode', True)
                 return self.say('Напишите обычным сообщением, например: «Добавь рубрику Банкротства банков с запросами и ключевыми словами» или «Что улучшить в коде?». '
@@ -384,6 +464,10 @@ class Controller:
             if verb == 'deltarget':
                 found = next(t for t in targets if t['chat_id'] == parts[1])
                 targets.remove(found)
+                watches = self.store.get('fed_watch') or {}
+                for watch in watches.values():
+                    watch['targets'] = [chat for chat in watch['targets'] if chat != parts[1]]
+                self.store.put('fed_watch', watches)
             else:
                 key = parts[1]
                 settings = categories[key]
@@ -426,6 +510,17 @@ class Controller:
                 return self.start_ai(text)
             return self.menu()
         step = session['step']
+        if step == 'fed_inn':
+            if not fedmonitor.valid_inn(text):
+                return self.say('Введите корректный 10-значный ИНН юридического лица. Контрольная цифра должна совпадать.')
+            if self.store.get('fed_resolve'):
+                return self.say('Предыдущая компания ещё проверяется. Подождите.')
+            watches = self.store.get('fed_watch') or {}
+            if text in watches or len(watches) >= 20:
+                return self.say('Компания уже на мониторинге или достигнут лимит 20 компаний.')
+            self.store.put('fed_resolve', text)
+            self.store.put('session', None)
+            return self.say('Проверяю компанию на бесплатном сайте Федресурса. После поиска потребуется подтверждение.')
         if step == 'limit':
             if not re.fullmatch(r'[0-9]{1,2}', text) or not 1 <= int(text) <= 50:
                 return self.say('Введите целое число от 1 до 50. /cancel — отмена.')
@@ -523,13 +618,16 @@ def main():
     controller = Controller(store, api, int(raw), ai_worker)
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
         ('start', 'Панель управления'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
-        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('cancel', 'Отмена'))])
+        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('fed', 'Мониторинг Федресурса'), ('fedadd', 'Добавить компанию по ИНН'), ('fednow', 'Сообщения Федресурса сегодня'), ('cancel', 'Отмена'))])
     worker = ThreadPoolExecutor(max_workers=1)
     runner = DeliveryRunner(store, api, int(raw), worker)
+    fed_worker = ThreadPoolExecutor(max_workers=1)
+    fed_runner = fedmonitor.Coordinator(store, api, int(raw), fed_worker, lambda chat: validate_target(api, chat, int(raw)))
     while True:
         try:
             runner.tick(datetime.now(timezone.utc))
             controller.tick_ai()
+            fed_runner.tick(datetime.now(timezone.utc))
             updates = api('getUpdates', offset=store.get('offset') or 0, timeout=20,
                           allowed_updates=['message', 'callback_query'])
             for update in updates:

@@ -87,7 +87,7 @@ class RoutingTests(ControlTests):
     def test_native_chat_picker_and_remove_recipient(self):
         self.message('/recipient')
         markup = self.api.call_args.kwargs['reply_markup']
-        self.assertTrue(markup['keyboard'][1][0]['request_chat']['chat_is_channel'])
+        self.assertTrue(any(b.get('request_chat',{}).get('chat_is_channel') for row in markup['keyboard'] for b in row))
         from unittest.mock import patch
         with patch('control.validate_target', return_value={'chat_id': '-1001', 'title': 'N', 'categories': []}):
             self.c.handle({'message': {'from': {'id': 123}, 'chat': {'id': 123, 'type': 'private'},
@@ -128,3 +128,30 @@ class RoutingTests(ControlTests):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UserPickerTests(ControlTests):
+    def test_choose_person_without_typing_id(self):
+        self.message('/recipient')
+        keyboard=self.api.call_args.kwargs['reply_markup']['keyboard']
+        self.assertTrue(any('request_users' in b for row in keyboard for b in row))
+        self.api.side_effect=lambda method,**kw: {'id':456,'type':'private','first_name':'Иван'} if method=='getChat' else True
+        self.c.handle({'message':{'from':{'id':123},'chat':{'id':123,'type':'private'},
+            'users_shared':{'request_id':3,'users':[{'user_id':456,'first_name':'Подмена'}]}}})
+        target=self.store.config()['targets'][0]
+        self.assertEqual(target['chat_id'],'456')
+        self.assertEqual(target['title'],'Иван')
+    def test_picker_rejects_unexpected_request_id(self):
+        self.message('/recipient')
+        self.c.handle({'message':{'from':{'id':123},'chat':{'id':123,'type':'private'},
+            'users_shared':{'request_id':99,'users':[{'user_id':456}]}}})
+        self.assertEqual(self.store.config()['targets'],[])
+    def test_unreachable_person_gets_start_instruction(self):
+        self.message('/recipient')
+        def api(method,**kw):
+            if method=='getChat': raise ValueError('not found')
+        self.api.side_effect=api
+        self.c.handle({'message':{'from':{'id':123},'chat':{'id':123,'type':'private'},
+            'users_shared':{'request_id':3,'users':[{'user_id':456}]}}})
+        self.assertEqual(self.store.config()['targets'],[])
+        self.assertTrue(any('/start' in call.kwargs.get('text','') for call in self.api.call_args_list))

@@ -459,13 +459,13 @@ class Controller:
                 return
             if action == 'target':
                 self.store.put('session', {'step': 'target'})
-                rows = [[{'text': 'Мой личный чат'}], [{'text': 'Выбрать канал', 'request_chat': {
+                rows = [[{'text': 'Мой личный чат'}], [{'text': 'Выбрать пользователя по имени', 'request_users': {'request_id': 3, 'user_is_bot': False, 'max_quantity': 1, 'request_name': True, 'request_username': True}}], [{'text': 'Выбрать канал', 'request_chat': {
                     'request_id': 1, 'chat_is_channel': True, 'request_title': True, 'bot_is_member': True,
                     'user_administrator_rights': admin_rights(True), 'bot_administrator_rights': admin_rights(True)}}],
                     [{'text': 'Выбрать группу', 'request_chat': {'request_id': 2, 'chat_is_channel': False,
                     'request_title': True, 'bot_is_member': True, 'user_administrator_rights': admin_rights(False),
                     'bot_administrator_rights': admin_rights(False)}}]]
-                return self.say('Добавьте бота администратором, затем выберите чат кнопкой или отправьте числовой chat_id. /cancel — отмена.',
+                return self.say('Для человека: сначала попросите его открыть @News_crp_bot и нажать /start, затем нажмите «Выбрать пользователя по имени». ID вводить не нужно. По одному @username Telegram не позволяет найти личный чат. Для группы/канала назначьте бота администратором и выберите чат кнопкой. Числовой chat_id также поддерживается. /cancel — отмена.',
                                 markup={'keyboard': rows, 'resize_keyboard': True, 'one_time_keyboard': True})
             parts = action.split(':')
             verb = parts[0]
@@ -549,7 +549,20 @@ class Controller:
             if shared and shared.get('request_id') not in (1, 2):
                 raise ValueError()
             raw = shared.get('chat_id', self.admin if text == 'Мой личный чат' else text)
-            target = validate_target(self.api, raw, self.admin)
+            users = message.get('users_shared')
+            if users is not None:
+                selected=users.get('users',[])
+                if users.get('request_id')!=3 or not isinstance(selected,list) or len(selected)!=1:
+                    raise ValueError()
+                raw=selected[0].get('user_id')
+                if isinstance(raw,bool) or not isinstance(raw,int) or raw<=0:
+                    raise ValueError()
+                try:
+                    target=validate_target(self.api,raw,self.admin)
+                except ValueError:
+                    return self.say('Не удалось подтвердить личный чат. Попросите этого пользователя открыть @News_crp_bot, нажать /start и разблокировать бота, затем выберите его ещё раз.')
+            else:
+                target = validate_target(self.api, raw, self.admin)
             if any(t['chat_id'] == target['chat_id'] for t in targets):
                 raise ValueError()
             targets.append(target)

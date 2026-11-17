@@ -145,17 +145,22 @@ def field_prompt(field):
 
 class DeliveryRunner:
     """One worker serializes manual and scheduled sends using existing history."""
-    def __init__(self, store, api, admin, worker):
+    def __init__(self, store, api, admin, worker, validator=None):
         self.store, self.api, self.admin, self.worker = store, api, admin, worker
         self.future = None
         self.job = None
+        self.validator = validator or (lambda chat: validate_target(self.api, chat, self.admin))
+        self.notify_admin = admin
         self.retry_at = 0
         if self.store.get('last_slot') is None and self.store.get('last_daily'):
             self.store.put('last_slot', self.store.get('last_daily') + ' 08:00')
 
     def notify(self, text):
+        from access import authorized
+        if not authorized(self.store.path,self.admin,self.notify_admin):
+            return
         try:
-            self.api('sendMessage', chat_id=self.admin, text=text)
+            self.api('sendMessage', chat_id=self.notify_admin, text=text)
         except TelegramError:
             print('Could not send delivery status to administrator')
 
@@ -185,13 +190,19 @@ class DeliveryRunner:
         schedule = self.store.get('schedule')
         slot = due_slot(now, self.store.get('last_slot'), ['08:00'] if schedule is None else schedule)
         if request:
+            actor=self.store.get('manual_actor') or self.admin
+            from access import authorized
+            if not authorized(self.store.path,self.admin,actor):
+                self.store.put('manual_request',None)
+                return
+            self.notify_admin=actor
             self.job = ('manual', request)
         elif slot and time.monotonic() >= self.retry_at:
             self.job = ('scheduled', slot)
         else:
             return
         self.future = self.worker.submit(bot.main, config=self.store.config(),
-            target_validator=lambda chat: validate_target(self.api, chat, self.admin))
+            target_validator=self.validator)
 
 
 def buttons(rows):
@@ -213,7 +224,8 @@ class Controller:
         self.say('Панель управления новостями', [[('➕ Добавить тему', 'add'), ('📋 Рубрики', 'topics')],
                  [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule'), ('📰 Срез новостей сейчас', 'now')],
                  [('🔢 Количество новостей', 'limit'), ('🤖 ИИ-помощник', 'ai')],
-                 [('🏢 Мониторинг Федресурса', 'fed_menu')]])
+                 [('🏢 Мониторинг Федресурса', 'fed_menu')]] +
+                 ([[('🔐 Доступ к боту', 'access_menu')]] if getattr(self,'owner',self.admin)==self.admin else []))
 
     def start_ai(self, text):
         if not os.environ.get('OPENROUTER_API_KEY') or not os.environ.get('OPENROUTER_MODEL') or self.ai_worker is None:
@@ -441,6 +453,7 @@ class Controller:
                     return self.say('Срез уже выполняется или ожидает завершения текущей рассылки.')
                 if not any(t['categories'] for t in targets):
                     return self.say('Сначала добавьте получателя и назначьте ему хотя бы одну рубрику.')
+                self.store.put('manual_actor',self.admin)
                 self.store.put('manual_request', uuid.uuid4().hex)
                 return self.say('Срез поставлен в очередь. Сообщу о завершении; это может занять несколько минут.')
             if action == 'add':
@@ -636,23 +649,23 @@ def main():
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove the existing Telegram webhook before enabling polling')
     ai_worker = ThreadPoolExecutor(max_workers=1)
-    controller = Controller(store, api, int(raw), ai_worker)
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
-        ('start', 'Панель управления'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
+        ('start', 'Панель управления'), ('admins', 'Доступ к боту — владелец'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
         ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('fed', 'Мониторинг Федресурса'), ('fedadd', 'Добавить компанию по ИНН'), ('fednow', 'Сообщения Федресурса сегодня'), ('cancel', 'Отмена'))])
     worker = ThreadPoolExecutor(max_workers=1)
-    runner = DeliveryRunner(store, api, int(raw), worker)
+    from access import AccessManager, delivery_target
+    runner = DeliveryRunner(store, api, int(raw), worker,
+        validator=lambda chat: delivery_target(api,chat,int(raw),store.path))
     fed_worker = ThreadPoolExecutor(max_workers=1)
-    fed_runner = fedmonitor.Coordinator(store, api, int(raw), fed_worker, lambda chat: validate_target(api, chat, int(raw)))
+    manager = AccessManager(store,api,int(raw),ai_worker,fed_worker)
     while True:
         try:
             runner.tick(datetime.now(timezone.utc))
-            controller.tick_ai()
-            fed_runner.tick(datetime.now(timezone.utc))
+            manager.tick(datetime.now(timezone.utc))
             updates = api('getUpdates', offset=store.get('offset') or 0, timeout=20,
                           allowed_updates=['message', 'callback_query'])
             for update in updates:
-                controller.handle(update)
+                manager.handle(update)
                 store.put('offset', update['update_id'] + 1)
         except TelegramError as exc:
             print(str(exc))

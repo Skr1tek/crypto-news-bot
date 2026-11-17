@@ -289,10 +289,11 @@ def latest_job(path,watch,api,admin):
 
 
 class Coordinator:
-    def __init__(self,store,api,admin,worker,validate):
+    def __init__(self,store,api,admin,worker,validate,automatic=True):
         self.store,self.api,self.admin,self.worker,self.validate=store,api,admin,worker,validate
         self.future=None
         self.job=None
+        self.automatic=automatic
 
     def say(self,text,rows=None):
         self.api('sendMessage',chat_id=self.admin,text=text[:3800],reply_markup={'inline_keyboard':rows or [[{'text':'Меню','callback_data':'menu'}]]})
@@ -352,7 +353,7 @@ class Coordinator:
         elif inn:
             self.job=('resolve',inn)
             self.future=self.worker.submit(resolve_job,inn,self.store.path)
-        elif watches and (manual or time.time()-(self.store.get('fed_last_poll') or 0)>=(21600 if os.environ.get('CHECKO_API_KEY','').strip() else 900)):
+        elif watches and (manual or self.automatic and time.time()-(self.store.get('fed_last_poll') or 0)>=(21600 if os.environ.get('CHECKO_API_KEY','').strip() else 900)):
             self.job=('scan',manual)
             self.future=self.worker.submit(scan_job,self.store.path,watches,self.api,self.validate,now)
 

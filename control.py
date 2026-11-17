@@ -227,27 +227,39 @@ class Controller:
                  [('🏢 Мониторинг Федресурса', 'fed_menu')]] +
                  ([[('🔐 Доступ к боту', 'access_menu')]] if getattr(self,'owner',self.admin)==self.admin else []))
 
-    def start_ai(self, text):
+    def start_ai(self, text, web=False):
         if not os.environ.get('OPENROUTER_API_KEY') or not os.environ.get('OPENROUTER_MODEL') or self.ai_worker is None:
             return self.say('Для ИИ нужны OPENROUTER_API_KEY и OPENROUTER_MODEL в защищённых настройках сервера. Ключ в Telegram не отправляйте.')
         if self.ai_future is not None:
             return self.say('ИИ ещё отвечает на предыдущий запрос. Подождите или /cancel — отмена результата.')
         if not 1 <= len(text) <= 3000:
             return self.say('Отправьте запрос длиной до 3000 символов.')
+        if web and os.environ.get('OPENROUTER_WEB_SEARCH')!='1':
+            return self.say('Веб-поиск выключен. Он оплачивается отдельно в OpenRouter, даже с бесплатной моделью. Владелец может включить OPENROUTER_WEB_SEARCH=1 на сервере.')
         day = datetime.now(bot.MSK).date().isoformat()
         usage = self.store.get('ai_usage') or {}
         count = usage.get('count', 0) if usage.get('day') == day else 0
         if count >= 30:
             return self.say('Достигнут лимит 30 запросов ИИ за день по МСК.')
+        web_usage=self.store.get('web_usage') or {}
+        web_count=web_usage.get('count',0) if web_usage.get('day')==day else 0
+        if web and web_count>=5:
+            return self.say('Достигнут общий лимит 5 веб-поисков за день по МСК.')
         clean = assistant_api.redact(text)
         if clean != text:
             return self.say('В сообщении обнаружен секрет. Запрос не отправлен. Удалите токены и повторите.')
-        self.ai_context = assistant_api.context(self.store.config(), self.store.get('schedule'), clean)
+        self.ai_context = {'categories':{}} if web else assistant_api.context(self.store.config(), self.store.get('schedule'), clean)
         self.ai_text = clean
         self.ai_cancelled = False
         self.store.put('ai_draft', None)
         self.store.put('ai_usage', {'day': day, 'count': count + 1})
-        self.ai_future = self.ai_worker.submit(assistant_api.ask, clean, self.ai_context, self.store.get('ai_history') or [])
+        if web:
+            self.store.put('web_usage',{'day':day,'count':web_count+1})
+            self.ai_future=self.ai_worker.submit(assistant_api.ask,clean,self.ai_context,[],web=True)
+        else:
+            self.ai_future = self.ai_worker.submit(assistant_api.ask, clean, self.ai_context, self.store.get('ai_history') or [])
+        if web:
+            return self.say('Ищу в интернете через платный поиск OpenRouter: до 3 результатов. Запрос учтён в общем лимите 5 поисков в день. История диалога и настройки бота не передаются в поисковый запрос. /cancel — отменить показ ответа.')
         self.say('ИИ готовит ответ. Запрос, краткая история и настройки рубрик передаются OpenRouter; для вопросов по коду — также исходники бота без файлов секретов. /cancel — отмена результата.')
 
     def tick_ai(self):
@@ -258,14 +270,16 @@ class Controller:
             return
         try:
             result = assistant_api.validate_proposal(future.result(), self.ai_context)
+        except assistant_api.AssistantError as exc:
+            return self.say(str(exc))
         except (ValueError, Exception):
             return self.say('ИИ не смог ответить. Проверьте ключ, баланс и поддержку JSON Schema выбранной моделью OpenRouter. Настройки не изменены.')
         history = (self.store.get('ai_history') or []) + [
             {'role': 'user', 'content': self.ai_text},
             {'role': 'assistant', 'content': assistant_api.redact(result['reply'])}]
         self.store.put('ai_history', history[-6:])
-        for start in range(0, len(result['reply']), 1800):
-            self.say(assistant_api.redact(result['reply'][start:start + 1800]))
+        for part in assistant_api.reply_parts(result['reply']):
+            self.say(assistant_api.redact(part))
         if result['action'] != 'advice':
             nonce = uuid.uuid4().hex[:12]
             original = self.ai_context['categories'].get(result['topic_id'])
@@ -299,17 +313,23 @@ class Controller:
             self.store.put('ai_mode', False)
             self.store.put('ai_draft', None)
         commands = {'/start': 'menu', '/help': 'menu', '/topics': 'topics', '/add': 'add',
-                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/ai': 'ai', '/fed': 'fed_menu', '/fedadd': 'fed_add', '/fednow': 'fed_now', '/cancel': 'menu'}
+                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/ai': 'ai', '/search': 'web_search', '/fed': 'fed_menu', '/fedadd': 'fed_add', '/fednow': 'fed_now', '/cancel': 'menu'}
         fed_argument = None
+        search_argument = None
         if text.startswith('/'):
             pieces = text.split(maxsplit=1)
             command = pieces[0].split('@')[0]
             action = commands.get(command, 'menu')
+            if command == '/search' and len(pieces)==2:
+                search_argument=pieces[1].strip()
             if command == '/fedadd' and len(pieces) == 2:
                 fed_argument = pieces[1].strip()
         config = self.store.config()
         categories, targets = config['categories'], config['targets']
         session = self.store.get('session')
+        if search_argument is not None:
+            self.store.put('session',None)
+            return self.start_ai(search_argument,web=True)
         if fed_argument is not None:
             session = {'step': 'fed_inn'}
             self.store.put('session', session)
@@ -396,11 +416,14 @@ class Controller:
                     self.say(('✅ ' if chat in watch['targets'] else '⬜ ') + title,
                         [[('Переключить', 'fed_toggle:' + parts[1] + ':' + chat)]])
                 return
+            if action == 'web_search':
+                self.store.put('session',{'step':'web_query'})
+                return self.say('Что найти в интернете? Поиск оплачивается отдельно в OpenRouter; общий лимит — 5 в день. Например: последние сообщения о Таврическом банке с первоисточниками. /cancel — отмена.')
             if action == 'ai':
                 self.store.put('ai_mode', True)
                 return self.say('Напишите обычным сообщением, например: «Добавь рубрику Банкротства банков с запросами и ключевыми словами» или «Что улучшить в коде?». '
                     'ИИ предлагает изменения рубрик с подтверждением. Код он только обсуждает, не выполняет и не редактирует. '
-                    'Запросы и контекст передаются OpenRouter. /cancel — выйти.', [[('Очистить историю ИИ', 'ai_clear'), ('Меню', 'menu')]])
+                    'Запросы и контекст передаются OpenRouter. /cancel — выйти.', [[('🌐 Поиск в интернете', 'web_search')], [('Очистить историю ИИ', 'ai_clear'), ('Меню', 'menu')]])
             if action == 'ai_clear':
                 self.ai_cancelled = True
                 self.store.put('ai_history', [])
@@ -557,6 +580,11 @@ class Controller:
             self.store.put('schedule', times)
             self.store.put('session', None)
             return self.say('Расписание сохранено: ' + ', '.join(times) + ' МСК.')
+        if step == 'web_query':
+            if not text:
+                return self.say('Введите поисковый запрос текстом.')
+            self.store.put('session',None)
+            return self.start_ai(text,web=True)
         if step == 'target':
             shared = message.get('chat_shared', {})
             if shared and shared.get('request_id') not in (1, 2):
@@ -651,7 +679,7 @@ def main():
     ai_worker = ThreadPoolExecutor(max_workers=1)
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
         ('start', 'Панель управления'), ('admins', 'Доступ к боту — владелец'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
-        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('fed', 'Мониторинг Федресурса'), ('fedadd', 'Добавить компанию по ИНН'), ('fednow', 'Сообщения Федресурса сегодня'), ('cancel', 'Отмена'))])
+        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('search', 'Поиск в интернете — ИИ'), ('fed', 'Мониторинг Федресурса'), ('fedadd', 'Добавить компанию по ИНН'), ('fednow', 'Сообщения Федресурса сегодня'), ('cancel', 'Отмена'))])
     worker = ThreadPoolExecutor(max_workers=1)
     from access import AccessManager, delivery_target
     runner = DeliveryRunner(store, api, int(raw), worker,

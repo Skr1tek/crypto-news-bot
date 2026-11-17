@@ -1,3 +1,5 @@
+> Мониторинг чужих публичных Telegram-каналов: [установка отдельного сборщика](TELEGRAM_CHANNELS_SETUP.md).
+
 > Для Checko (без браузера), лимита 100 запросов и кнопки последней записи: [CHECKO_SETUP.md](CHECKO_SETUP.md). При CHECKO_API_KEY приоритет имеет Checko.
 
 # Криптообзор в Telegram

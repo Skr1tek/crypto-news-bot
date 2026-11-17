@@ -10,3 +10,6 @@ patch_*.py
 
 .fed-browser/
 work-fedresurs.html
+
+*.session
+*.session-*

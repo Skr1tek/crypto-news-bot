@@ -224,7 +224,7 @@ class Controller:
         self.say('Панель управления новостями', [[('➕ Добавить тему', 'add'), ('📋 Рубрики', 'topics')],
                  [('👥 Получатели', 'targets'), ('➕ Получатель', 'target')], [('🕗 Расписание', 'schedule'), ('📰 Срез новостей сейчас', 'now')],
                  [('🔢 Количество новостей', 'limit'), ('🤖 ИИ-помощник', 'ai')],
-                 [('🏢 Мониторинг Федресурса', 'fed_menu')]] +
+                 [('🏢 Мониторинг Федресурса', 'fed_menu')], [('📣 Мониторинг Telegram','tg_menu')]] +
                  ([[('🔐 Доступ к боту', 'access_menu')]] if getattr(self,'owner',self.admin)==self.admin else []))
 
     def start_ai(self, text, web=False):
@@ -313,7 +313,7 @@ class Controller:
             self.store.put('ai_mode', False)
             self.store.put('ai_draft', None)
         commands = {'/start': 'menu', '/help': 'menu', '/topics': 'topics', '/add': 'add',
-                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/ai': 'ai', '/search': 'web_search', '/fed': 'fed_menu', '/fedadd': 'fed_add', '/fednow': 'fed_now', '/cancel': 'menu'}
+                    '/recipients': 'targets', '/recipient': 'target', '/schedule': 'schedule', '/now': 'now', '/limit': 'limit', '/ai': 'ai', '/tg': 'tg_menu', '/tgadd': 'tg_add', '/search': 'web_search', '/fed': 'fed_menu', '/fedadd': 'fed_add', '/fednow': 'fed_now', '/cancel': 'menu'}
         fed_argument = None
         search_argument = None
         if text.startswith('/'):
@@ -335,6 +335,9 @@ class Controller:
             self.store.put('session', session)
             text = fed_argument
             action = None
+        if (action and action.startswith('tg_')) or (not action and (session or {}).get('step','').startswith('tg_')):
+            import tgmonitor
+            return tgmonitor.ui(self,message,action,text)
         if action:
             if action in ('menu', 'topics', 'targets', 'add', 'target', 'schedule', 'schedule_edit', 'now', 'limit', 'ai', 'fed_menu', 'fed_add', 'fed_now'):
                 self.store.put('session', None)
@@ -508,6 +511,10 @@ class Controller:
             if verb == 'deltarget':
                 found = next(t for t in targets if t['chat_id'] == parts[1])
                 targets.remove(found)
+                tg_watches=self.store.get('tg_watch') or {}
+                for watch in tg_watches.values():
+                    watch['targets']=[chat for chat in watch['targets'] if chat!=parts[1]]
+                self.store.put('tg_watch',tg_watches)
                 watches = self.store.get('fed_watch') or {}
                 for watch in watches.values():
                     watch['targets'] = [chat for chat in watch['targets'] if chat != parts[1]]
@@ -679,7 +686,7 @@ def main():
     ai_worker = ThreadPoolExecutor(max_workers=1)
     api('setMyCommands', commands=[{'command': c, 'description': d} for c, d in (
         ('start', 'Панель управления'), ('admins', 'Доступ к боту — владелец'), ('add', 'Добавить рубрику'), ('topics', 'Рубрики и назначения'),
-        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('search', 'Поиск в интернете — ИИ'), ('fed', 'Мониторинг Федресурса'), ('fedadd', 'Добавить компанию по ИНН'), ('fednow', 'Сообщения Федресурса сегодня'), ('cancel', 'Отмена'))])
+        ('recipients', 'Получатели'), ('recipient', 'Добавить получателя'), ('schedule', 'Расписание'), ('now', 'Срез новостей сейчас'), ('limit', 'Количество новостей'), ('ai', 'ИИ-помощник'), ('tg', 'Мониторинг Telegram-каналов'), ('tgadd', 'Добавить Telegram-канал'), ('search', 'Поиск в интернете — ИИ'), ('fed', 'Мониторинг Федресурса'), ('fedadd', 'Добавить компанию по ИНН'), ('fednow', 'Сообщения Федресурса сегодня'), ('cancel', 'Отмена'))])
     worker = ThreadPoolExecutor(max_workers=1)
     from access import AccessManager, delivery_target
     runner = DeliveryRunner(store, api, int(raw), worker,

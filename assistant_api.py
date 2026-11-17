@@ -13,7 +13,7 @@ class AssistantError(ValueError):
 
 
 def redact(text):
-    for name in ('OPENROUTER_API_KEY','TELEGRAM_BOT_TOKEN','CHECKO_API_KEY'):
+    for name in ('OPENROUTER_API_KEY','TELEGRAM_BOT_TOKEN','CHECKO_API_KEY','TG_API_HASH'):
         value=os.environ.get(name,'')
         if value:
             text=text.replace(value,'[секрет скрыт]')

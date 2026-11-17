@@ -180,6 +180,11 @@ class BrowserReader:
 
 def message_parts(watch,record):
     url=message_url(record['url'])
+    if record.get('source')=='checko':
+        return ['📋 <b>ЕФРСБ · Checko</b>\n<b>'+html.escape(watch['name'][:250])+'</b>\nИНН: '+watch['inn']+\
+            '\nТема: '+html.escape(record['title'])+'\nДата: '+record['date'].strftime('%d.%m.%Y')+\
+            ('\n⚠️ Сообщение аннулировано' if record.get('annulled') else '')+\
+            '\n<a href="'+html.escape(url,quote=True)+'">Открыть сообщение</a>']
     header=('📋 <b>Федресурс</b>\nКомпания: '+html.escape(watch['name'][:250])+'\nИНН: '+watch['inn']+
             '\nДолжник: '+html.escape(record['debtor'][:250])+'\nСообщение №'+html.escape(str(record['number']))+
             ' от '+record['date'].astimezone(MSK).strftime('%d.%m.%Y %H:%M:%S')+' МСК\n')
@@ -250,18 +255,37 @@ def scan(path,watches,api,validate,now,reader):
     return result
 
 
-def resolve_job(inn):
-    with BrowserReader() as reader:
+def reader_factory(path=None):
+    if os.environ.get('CHECKO_API_KEY','').strip():
+        from checkoreader import CheckoReader
+        return CheckoReader(path)
+    return BrowserReader()
+
+
+def resolve_job(inn,path=None):
+    with reader_factory(path) as reader:
         return reader.resolve(inn)
 
 
 def scan_job(path,watches,api,validate,now):
     try:
-        with BrowserReader() as reader:
+        with reader_factory(path) as reader:
             return scan(path,watches,api,validate,now,reader)
     except Exception as exc:
         reason=str(exc) if isinstance(exc,FedError) else 'Браузерная проверка не выполнена.'
         return {'sent':0,'checked':0,'errors':[reason],'day':moscow_day(now).isoformat()}
+
+
+def latest_job(path,watch,api,admin):
+    with reader_factory(path) as reader:
+        if not hasattr(reader,'latest'):
+            raise FedError('Последняя запись доступна при подключении Checko.')
+        row=reader.latest(watch)
+        if row is None:
+            api('sendMessage',chat_id=admin,text='В Checko нет записей по ИНН '+watch['inn'])
+            return
+        for part in message_parts(watch,reader.message(row,watch)):
+            api('sendMessage',chat_id=admin,text=part,parse_mode='HTML',disable_web_page_preview=True)
 
 
 class Coordinator:
@@ -277,7 +301,14 @@ class Coordinator:
         if self.future is not None and self.future.done():
             kind,identity=self.job
             future,self.future=self.future,None
-            if kind=='resolve':
+            if kind=='latest':
+                try:
+                    future.result()
+                except Exception as exc:
+                    self.say(str(exc) if isinstance(exc,FedError) else 'Последняя запись не получена.')
+                finally:
+                    self.store.put('fed_latest',None)
+            elif kind=='resolve':
                 try:
                     watch=future.result()
                     watch.update(nonce=uuid.uuid4().hex[:12],created=time.time(),targets=[str(self.admin)])
@@ -310,10 +341,18 @@ class Coordinator:
         inn=self.store.get('fed_resolve')
         watches=list((self.store.get('fed_watch') or {}).values())
         manual=self.store.get('fed_manual')
-        if inn:
+        latest=self.store.get('fed_latest')
+        if latest:
+            watch=(self.store.get('fed_watch') or {}).get(latest)
+            if not watch:
+                self.store.put('fed_latest',None)
+                return
+            self.job=('latest',latest)
+            self.future=self.worker.submit(latest_job,self.store.path,watch,self.api,self.admin)
+        elif inn:
             self.job=('resolve',inn)
-            self.future=self.worker.submit(resolve_job,inn)
-        elif watches and (manual or time.time()-(self.store.get('fed_last_poll') or 0)>=900):
+            self.future=self.worker.submit(resolve_job,inn,self.store.path)
+        elif watches and (manual or time.time()-(self.store.get('fed_last_poll') or 0)>=(21600 if os.environ.get('CHECKO_API_KEY','').strip() else 900)):
             self.job=('scan',manual)
             self.future=self.worker.submit(scan_job,self.store.path,watches,self.api,self.validate,now)
 
@@ -326,7 +365,7 @@ if __name__=='__main__':
     if not valid_inn(args.check):
         raise SystemExit('Нужен корректный 10-значный ИНН юридического лица.')
     try:
-        with BrowserReader() as reader:
+        with reader_factory() as reader:
             company=reader.resolve(args.check)
             print('Компания:',company['name'],'ИНН',company['inn'])
             now=datetime.now(timezone.utc)
@@ -334,7 +373,7 @@ if __name__=='__main__':
             print('Дата МСК:',moscow_day(now),'Найдено сообщений:',len(rows))
             for row in rows:
                 record=reader.message(row,company)
-                print('Сообщение №'+record['number'],record['date'].isoformat(),record['url'],'символов текста:',len(record['text']))
+                print(record.get('title') or 'Сообщение №'+record['number'],record['date'].isoformat(),record['url'])
         print('Проверка источника завершена. Отправки в Telegram не было.')
     except Exception as exc:
         raise SystemExit(str(exc) if isinstance(exc,FedError) else 'Проверка не выполнена: сайт недоступен или изменил разметку.') from None

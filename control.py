@@ -312,7 +312,7 @@ class Controller:
             if action == 'fed_menu':
                 self.store.put('fed_pending', None)
                 status = self.store.get('fed_status') or {}
-                return self.say('Мониторинг Федресурса: компании по ИНН. Проверка каждые 15 минут, только текущий день по МСК. '
+                return self.say('Мониторинг Федресурса: компании по ИНН. Checko: проверка каждые 6 часов, только текущий день по МСК; до 90 запросов за 24 часа. Без Checko: сайт каждые 15 минут. '
                     'При добавлении получатель — ваш личный чат.\nПоследняя проверка: ' + str(status.get('checked_at', 'ещё не выполнялась')) +
                     ('\nЕсть ошибки проверки: ' + '; '.join(status['errors'])[:1400] if status.get('errors') else ''),
                     [[('Добавить лицо', 'fed_add'), ('Список компаний', 'fed_list')], [('Проверить сегодня', 'fed_now')]])
@@ -324,8 +324,16 @@ class Controller:
                 self.say('На мониторинге компаний: ' + str(len(watches)))
                 for inn, watch in watches.items():
                     self.say(watch['name'] + '\nИНН ' + inn + '\nПолучателей: ' + str(len(watch['targets'])),
-                        [[('Получатели', 'fed_targets:' + inn), ('Снять с мониторинга', 'fed_delete:' + inn)]])
+                        [[('Последнее сообщение ЕФРСБ', 'fed_latest:' + inn)], [('Получатели', 'fed_targets:' + inn), ('Снять с мониторинга', 'fed_delete:' + inn)]])
                 return
+            if action.startswith('fed_latest:'):
+                inn=action.split(':',1)[1]
+                if inn not in (self.store.get('fed_watch') or {}):
+                    return self.say('Компания не найдена.')
+                if self.store.get('fed_latest'):
+                    return self.say('Запрос уже ожидается. Дождитесь результата.')
+                self.store.put('fed_latest',inn)
+                return self.say('Покажу последнюю доступную запись ЕФРСБ только вам. История рассылки не изменится.')
             if action == 'fed_now':
                 if not self.store.get('fed_watch'):
                     return self.say('Сначала добавьте компанию на мониторинг.')
